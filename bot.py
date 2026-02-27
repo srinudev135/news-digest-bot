@@ -161,88 +161,68 @@ async def fetch_section(key: str, cfg: dict) -> list[dict]:
 #  TELUGU TRANSLATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-import re
-
-async def translate_headlines_to_telugu(section_label: str, articles: list[dict]) -> list[str]:
-    """Use Claude to translate all headlines in a section to Telugu in one API call."""
-    if not articles:
-        return []
-
-    numbered = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
-    prompt = (
-        f"You must translate the following English news headlines into Telugu script (తెలుగు).\n"
-        f"Rules:\n"
-        f"- Output ONLY the translated lines, numbered the same way\n"
-        f"- Every line MUST be in Telugu script, not English\n"
-        f"- Keep brand names, company names, and people's names in English\n"
-        f"- Do NOT output anything else — no intro, no explanation\n\n"
-        f"Headlines to translate:\n{numbered}"
-    )
-
-    try:
-        logger.info(f"Translating {len(articles)} headlines for '{section_label}' to Telugu...")
-        resp = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text.strip()
-        logger.info(f"Telugu translation raw response for '{section_label}':\n{raw}")
-
-        lines = raw.split("\n")
-        translations = []
-        for line in lines:
-            line = line.strip()
-            if line:
-                # Remove leading numbering like "1." "1)" "1-"
-                cleaned = re.sub(r"^\d+[\.\)\-]\s*", "", line).strip()
-                if cleaned:
-                    translations.append(cleaned)
-
-        logger.info(f"Parsed {len(translations)} translations for '{section_label}'")
-
-        # Pad with originals if we got fewer back than expected
-        while len(translations) < len(articles):
-            translations.append(articles[len(translations)]["title"])
-
-        return translations[:len(articles)]
-
-    except Exception as e:
-        logger.error(f"Telugu translation FAILED for '{section_label}': {e}")
-        return [a["title"] for a in articles]
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  FORMATTING  (clean numbered list, one message per section)
+#  SECTION MESSAGE BUILDER (Telugu via Claude)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_section_message(key: str, articles: list[dict], telugu_titles: list[str]) -> tuple[str, InlineKeyboardMarkup]:
+async def build_telugu_section(key: str, articles: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Returns (HTML text, keyboard) for one section with Telugu headlines.
+    Ask Claude to translate headlines to Telugu and return formatted HTML + keyboard.
+    Falls back to English if translation fails.
     """
     cfg     = SECTIONS[key]
     emoji   = cfg["emoji"]
     label   = cfg["label"].upper()
     divider = "―" * 22
 
-    lines = ""
-    for i, title in enumerate(telugu_titles, 1):
-        lines += f"{i}. {h(title)}\n"
+    # Build numbered English list for Claude
+    english_lines = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
 
-    text = f"{divider}\n{emoji} <b>{h(label)}</b>\n{divider}\n\n{lines}"
+    # Ask Claude to translate — very simple prompt, just return numbered Telugu lines
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Translate these news headlines to Telugu. "
+                    f"Reply with ONLY the numbered Telugu translations. "
+                    f"Keep company names and people names in English.\n\n"
+                    f"{english_lines}"
+                )
+            }],
+        )
+        translated = resp.content[0].text.strip()
+        logger.info(f"Telugu output for {label}:\n{translated}")
 
-    # Row 1: Ask Claude buttons
-    ask_row  = [
-        InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}")
-        for i in range(1, len(articles) + 1)
-    ]
-    # Row 2: Read article buttons
-    link_row = [
-        InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])
-        for i in range(1, len(articles) + 1)
-    ]
+        # Parse numbered lines from Claude response
+        titles = []
+        for line in translated.split("\n"):
+            line = line.strip()
+            if line:
+                cleaned = re.sub(r"^\d+[\.\)\:\-]\s*", "", line).strip()
+                if cleaned:
+                    titles.append(cleaned)
 
+        # Pad with English if short
+        while len(titles) < len(articles):
+            titles.append(articles[len(titles)]["title"])
+        titles = titles[:len(articles)]
+
+    except Exception as e:
+        logger.error(f"Translation error for {label}: {e}")
+        titles = [a["title"] for a in articles]
+
+    # Build the message
+    lines = "\n".join(f"{i}. {h(t)}" for i, t in enumerate(titles, 1))
+    text  = f"{divider}\n{emoji} <b>{h(label)}</b>\n{divider}\n\n{lines}"
+
+    # Buttons
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}") for i in range(1, len(articles)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])         for i in range(1, len(articles)+1)]
     keyboard = InlineKeyboardMarkup([ask_row, link_row])
+
     return text, keyboard
 
 
@@ -281,10 +261,8 @@ async def send_digest(app: Application, chat_id: int):
             )
             continue
 
-        # Translate headlines to Telugu
-        telugu_titles = await translate_headlines_to_telugu(cfg["label"], articles)
-
-        text, keyboard = build_section_message(key, articles, telugu_titles)
+        # Build Telugu section message
+        text, keyboard = await build_telugu_section(key, articles)
         await app.bot.send_message(
             chat_id=chat_id,
             text=text,
@@ -376,14 +354,44 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id     = update.effective_chat.id
+    user_text   = update.message.text
+    pending     = context.user_data.get("pending_story")
+
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await ask_claude(chat_id, update.message.text)
-    await update.message.reply_text(reply)
+
+    if pending:
+        # User is answering a follow-up prompt about a specific story
+        section_key = pending["section_key"]
+        idx         = pending["idx"]
+        context.user_data.pop("pending_story")   # clear it
+
+        article = todays_digest.get(section_key, [])[idx] if todays_digest else None
+        cfg     = SECTIONS.get(section_key, {})
+
+        if article:
+            full_prompt = (
+                f"The user is asking about this specific news story:\n"
+                f"Section: {cfg.get('label', '')}\n"
+                f"Title: {article['title']}\n"
+                f"Summary: {article['summary']}\n\n"
+                f"User's question: {user_text}\n\n"
+                f"Answer in Telugu in 3-5 sentences. Keep company/people names in English."
+            )
+            reply = await ask_claude(chat_id, full_prompt)
+        else:
+            reply = await ask_claude(chat_id, user_text)
+
+        await update.message.reply_text(reply)
+
+    else:
+        # Normal free-text question
+        reply = await ask_claude(chat_id, user_text)
+        await update.message.reply_text(reply)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 💬 N button — ask Claude about that specific story."""
+    """Handle 💬 N button — show story title and prompt user to ask a question."""
     q = update.callback_query
     await q.answer()
 
@@ -392,23 +400,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx     = int(idx_str)
         article = todays_digest.get(section_key, [])[idx]
     except (ValueError, IndexError):
-        await q.message.reply_text("Couldn't find that story. Try /digest to refresh.")
+        await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి.")
         return
 
-    cfg    = SECTIONS[section_key]
-    prompt = (
-        f"The user tapped on story #{idx+1} from the {cfg['label']} section:\n\n"
-        f"Title: {article['title']}\n"
-        f"Summary: {article['summary']}\n\n"
-        f"Give a sharp 3-5 sentence analysis: what happened, why it matters, and what to watch next."
-    )
+    cfg = SECTIONS[section_key]
 
-    chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await ask_claude(chat_id, prompt)
+    # Store which story the user selected — next message will be their question
+    context.user_data["pending_story"] = {
+        "section_key": section_key,
+        "idx":         idx,
+    }
 
+    # Show story title and ask for their question
     await q.message.reply_text(
-        f"<i>{h(cfg['emoji'])} {h(cfg['label'])} #{idx+1}: {h(article['title'])}</i>\n\n{h(reply)}",
+        f"📌 <b>{h(cfg['emoji'])} {h(cfg['label'])} #{idx+1}</b>\n"
+        f"<i>{h(article['title'])}</i>\n\n"
+        f"❓ ఈ వార్త గురించి మీ ప్రశ్న అడగండి — నేను తెలుగులో జవాబిస్తాను.",
         parse_mode="HTML",
     )
 
