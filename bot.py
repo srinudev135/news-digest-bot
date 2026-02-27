@@ -4,9 +4,11 @@ Daily News Digest Telegram Bot v2
 - Clean UI: 4 sections, numbered stories, per-story follow-up buttons
 - Sections: AI Tech | Finance | GeoPolitics | Crypto
 - Powered by Claude AI for summaries and follow-up chat
+- Uses HTML parse mode throughout (avoids MarkdownV2 escape headaches)
 """
 
 import os
+import html
 import logging
 import feedparser
 import httpx
@@ -32,6 +34,11 @@ NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── HTML helper ───────────────────────────────────────────────────────────────
+def h(text: str) -> str:
+    """Escape text for Telegram HTML mode."""
+    return html.escape(str(text))
 
 # ── Section definitions ───────────────────────────────────────────────────────
 # Each section has an emoji, display label, RSS feeds, and a NewsAPI query
@@ -153,49 +160,38 @@ async def fetch_section(key: str, cfg: dict) -> list[dict]:
 #  FORMATTING  (clean numbered list, one message per section)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def escape_md(text: str) -> str:
-    """Escape special MarkdownV2 characters."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
 def build_section_message(key: str, articles: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Returns (text, keyboard) for one section.
+    Returns (HTML text, keyboard) for one section.
 
     Format:
-    ────────────────────
-    🤖 *AI TECH*
-    ────────────────────
+    ――――――――――――――――――――――
+    🤖 <b>AI TECH</b>
+    ――――――――――――――――――――――
     1. Article headline one
     2. Article headline two
-    3. Article headline three
-    4. Article headline four
-    5. Article headline five
+    ...
 
-    [ 💬 1 ] [ 💬 2 ] [ 💬 3 ] [ 💬 4 ] [ 💬 5 ]
-    [ 🔗 1 ] [ 🔗 2 ] [ 🔗 3 ] [ 🔗 4 ] [ 🔗 5 ]
+    [ 💬 1 ][ 💬 2 ][ 💬 3 ][ 💬 4 ][ 💬 5 ]
+    [ 🔗 1 ][ 🔗 2 ][ 🔗 3 ][ 🔗 4 ][ 🔗 5 ]
     """
-    cfg   = SECTIONS[key]
-    emoji = cfg["emoji"]
-    label = cfg["label"].upper()
-
-    divider = escape_md("―" * 22)
-    header  = f"{divider}\n{emoji} *{escape_md(label)}*\n{divider}\n\n"
+    cfg     = SECTIONS[key]
+    emoji   = cfg["emoji"]
+    label   = cfg["label"].upper()
+    divider = "―" * 22
 
     lines = ""
     for i, a in enumerate(articles, 1):
-        lines += f"{i}\\. {escape_md(a['title'])}\n"
+        lines += f"{i}. {h(a['title'])}\n"
 
-    text = header + lines
+    text = f"{divider}\n{emoji} <b>{h(label)}</b>\n{divider}\n\n{lines}"
 
-    # Row 1: "Ask about #N" buttons
+    # Row 1: Ask Claude buttons
     ask_row  = [
         InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}")
         for i in range(1, len(articles) + 1)
     ]
-    # Row 2: "Read link #N" buttons
+    # Row 2: Read article buttons
     link_row = [
         InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])
         for i in range(1, len(articles) + 1)
@@ -212,19 +208,17 @@ def build_section_message(key: str, articles: list[dict]) -> tuple[str, InlineKe
 async def send_digest(app: Application, chat_id: int):
     global todays_digest
 
-    # Header message
-    now_ist = datetime.utcnow()  # approx; actual IST offset handled by schedule
-    date_str = escape_md(now_ist.strftime("%A, %d %B %Y"))
+    date_str = datetime.utcnow().strftime("%A, %d %B %Y")
     await app.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🌅 *Good Morning\\!*\n"
-            f"📅 {date_str}\n\n"
-            f"Here are your top stories for today\\.\n"
-            f"Tap 💬 on any story number to ask Claude about it\\.\n"
-            f"Tap 🔗 to read the full article\\."
+            f"🌅 <b>Good Morning!</b>\n"
+            f"📅 {h(date_str)}\n\n"
+            f"Here are your top stories for today.\n"
+            f"Tap 💬 on any story number to ask Claude about it.\n"
+            f"Tap 🔗 to read the full article."
         ),
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
     )
 
     todays_digest = {}
@@ -237,8 +231,8 @@ async def send_digest(app: Application, chat_id: int):
         if not articles:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"{cfg['emoji']} *{escape_md(cfg['label'].upper())}*\n\n_No stories found today\\._",
-                parse_mode="MarkdownV2",
+                text=f"{cfg['emoji']} <b>{h(cfg['label'].upper())}</b>\n\n<i>No stories found today.</i>",
+                parse_mode="HTML",
             )
             continue
 
@@ -246,19 +240,15 @@ async def send_digest(app: Application, chat_id: int):
         await app.bot.send_message(
             chat_id=chat_id,
             text=text,
-            parse_mode="MarkdownV2",
+            parse_mode="HTML",
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
 
-    # Footer
     await app.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "✅ *That's your digest for today\\!*\n\n"
-            "You can also just *type any question* and I'll answer it\\."
-        ),
-        parse_mode="MarkdownV2",
+        text="✅ <b>That's your digest for today!</b>\n\nYou can also just <i>type any question</i> and I'll answer it.",
+        parse_mode="HTML",
     )
 
 
@@ -310,30 +300,30 @@ async def ask_claude(chat_id: int, message: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"👋 *Welcome to your Daily News Digest Bot\\!*\n\n"
-        f"Your Chat ID: `{chat_id}`\n\n"
-        f"📰 Every morning at *7:00 AM IST* I'll send you:\n\n"
-        f"🤖 *AI Tech* — top 5 stories\n"
-        f"💰 *Finance* — top 5 stories\n"
-        f"🌍 *GeoPolitics* — top 5 stories\n"
-        f"₿  *Crypto* — top 5 stories\n\n"
-        f"*Commands:*\n"
+        f"👋 <b>Welcome to your Daily News Digest Bot!</b>\n\n"
+        f"Your Chat ID: <code>{chat_id}</code>\n\n"
+        f"📰 Every morning at <b>7:00 AM IST</b> I'll send you:\n\n"
+        f"🤖 <b>AI Tech</b> — top 5 stories\n"
+        f"💰 <b>Finance</b> — top 5 stories\n"
+        f"🌍 <b>GeoPolitics</b> — top 5 stories\n"
+        f"₿  <b>Crypto</b> — top 5 stories\n\n"
+        f"<b>Commands:</b>\n"
         f"/digest — Get today's digest now\n"
         f"/clear — Clear chat history\n"
         f"/help — Show this message",
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
     )
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text("⏳ Fetching your digest\\.\\.\\. ~30 seconds", parse_mode="MarkdownV2")
+    await update.message.reply_text("⏳ Fetching your digest... about 30 seconds!")
     await send_digest(context.application, chat_id)
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history[update.effective_chat.id] = []
-    await update.message.reply_text("🧹 Conversation history cleared\\!", parse_mode="MarkdownV2")
+    await update.message.reply_text("🧹 Conversation history cleared!")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -368,11 +358,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     reply = await ask_claude(chat_id, prompt)
 
-    # Show which story they asked about, then the analysis
-    story_ref = escape_md(f"{cfg['emoji']} {cfg['label']} #{idx+1}: {article['title']}")
     await q.message.reply_text(
-        f"_{story_ref}_\n\n{escape_md(reply)}",
-        parse_mode="MarkdownV2",
+        f"<i>{h(cfg['emoji'])} {h(cfg['label'])} #{idx+1}: {h(article['title'])}</i>\n\n{h(reply)}",
+        parse_mode="HTML",
     )
 
 
