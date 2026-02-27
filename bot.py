@@ -8,6 +8,7 @@ Daily News Digest Telegram Bot v2
 """
 
 import os
+import re
 import html
 import logging
 import feedparser
@@ -160,39 +161,54 @@ async def fetch_section(key: str, cfg: dict) -> list[dict]:
 #  TELUGU TRANSLATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def translate_headlines_to_telugu(section_label: str, articles: list[dict]) -> list[str]:
-    """Use Claude to translate all headlines in a section to Telugu in one call."""
+import re
+
+async def translate_headlines_to_telugu(section_label: str, articles: list[dict]) -> list[str]:
+    """Use Claude to translate all headlines in a section to Telugu in one API call."""
     if not articles:
         return []
+
     numbered = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
     prompt = (
-        f"Translate these {section_label} news headlines to Telugu. "
-        f"Return ONLY the numbered translations, one per line, same numbering. "
-        f"Keep proper nouns (company names, people, places) in English within the Telugu text. "
-        f"Do not add any extra commentary.\n\n{numbered}"
+        f"You must translate the following English news headlines into Telugu script (తెలుగు).\n"
+        f"Rules:\n"
+        f"- Output ONLY the translated lines, numbered the same way\n"
+        f"- Every line MUST be in Telugu script, not English\n"
+        f"- Keep brand names, company names, and people's names in English\n"
+        f"- Do NOT output anything else — no intro, no explanation\n\n"
+        f"Headlines to translate:\n{numbered}"
     )
+
     try:
+        logger.info(f"Translating {len(articles)} headlines for '{section_label}' to Telugu...")
         resp = claude.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=600,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}],
         )
-        lines = resp.content[0].text.strip().split("\n")
-        # Strip numbering like "1. " from each line
+        raw = resp.content[0].text.strip()
+        logger.info(f"Telugu translation raw response for '{section_label}':\n{raw}")
+
+        lines = raw.split("\n")
         translations = []
         for line in lines:
             line = line.strip()
             if line:
-                # Remove leading "1. " "2. " etc
-                import re
-                cleaned = re.sub(r"^\d+\.\s*", "", line)
-                translations.append(cleaned)
-        # Pad with original titles if translation came back short
+                # Remove leading numbering like "1." "1)" "1-"
+                cleaned = re.sub(r"^\d+[\.\)\-]\s*", "", line).strip()
+                if cleaned:
+                    translations.append(cleaned)
+
+        logger.info(f"Parsed {len(translations)} translations for '{section_label}'")
+
+        # Pad with originals if we got fewer back than expected
         while len(translations) < len(articles):
             translations.append(articles[len(translations)]["title"])
+
         return translations[:len(articles)]
+
     except Exception as e:
-        logger.warning(f"Telugu translation failed: {e}")
+        logger.error(f"Telugu translation FAILED for '{section_label}': {e}")
         return [a["title"] for a in articles]
 
 
@@ -266,7 +282,7 @@ async def send_digest(app: Application, chat_id: int):
             continue
 
         # Translate headlines to Telugu
-        telugu_titles = translate_headlines_to_telugu(cfg["label"], articles)
+        telugu_titles = await translate_headlines_to_telugu(cfg["label"], articles)
 
         text, keyboard = build_section_message(key, articles, telugu_titles)
         await app.bot.send_message(
