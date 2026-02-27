@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Daily News Digest Telegram Bot
-- Sends rich daily digest at 7 AM IST
-- Supports follow-up questions via Claude AI
-- Covers: TikTok trends, Instagram trends, AI news, Tech news, Finance news
+Daily News Digest Telegram Bot v2
+- Clean UI: 4 sections, numbered stories, per-story follow-up buttons
+- Sections: AI Tech | Finance | GeoPolitics | Crypto
+- Powered by Claude AI for summaries and follow-up chat
 """
 
 import os
-import asyncio
 import logging
-import json
-from datetime import datetime
 import feedparser
 import httpx
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -20,427 +18,390 @@ from telegram.ext import (
 )
 import anthropic
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ── Config from environment ───────────────────────────────────────────────────
+# ── Environment ───────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]       # Your personal chat ID
-NEWS_API_KEY        = os.environ["NEWS_API_KEY"]            # newsapi.org
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
+NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── News sources ──────────────────────────────────────────────────────────────
-RSS_FEEDS = {
-    "🤖 AI & Tech": [
-        "https://techcrunch.com/category/artificial-intelligence/feed/",
-        "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-        "https://feeds.feedburner.com/venturebeat/SZYF",
-        "https://openai.com/news/rss.xml",
-    ],
-    "💻 Tech General": [
-        "https://feeds.wired.com/wired/index",
-        "https://techcrunch.com/feed/",
-        "https://www.theverge.com/rss/index.xml",
-    ],
-    "💰 Finance": [
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://feeds.bloomberg.com/markets/news.rss",  # may need auth
-        "https://www.cnbc.com/id/10000664/device/rss/rss.html",
-        "https://feeds.finance.yahoo.com/rss/2.0/headline",
-    ],
-    "📱 Social Trends (TikTok/Instagram)": [
-        "https://www.socialmediatoday.com/rss.xml",
-        "https://later.com/blog/feed/",
-        "https://www.socialsamosa.com/feed/",   # India Instagram trends
-        "https://www.businessofapps.com/feed/",
-    ],
+# ── Section definitions ───────────────────────────────────────────────────────
+# Each section has an emoji, display label, RSS feeds, and a NewsAPI query
+SECTIONS = {
+    "ai_tech": {
+        "emoji":  "🤖",
+        "label":  "AI Tech",
+        "rss": [
+            "https://techcrunch.com/category/artificial-intelligence/feed/",
+            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+            "https://feeds.feedburner.com/venturebeat/SZYF",
+        ],
+        "newsapi_q": "artificial intelligence technology",
+    },
+    "finance": {
+        "emoji":  "💰",
+        "label":  "Finance",
+        "rss": [
+            "https://feeds.reuters.com/reuters/businessNews",
+            "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+            "https://feeds.finance.yahoo.com/rss/2.0/headline",
+        ],
+        "newsapi_q": "finance markets economy",
+    },
+    "geopolitics": {
+        "emoji":  "🌍",
+        "label":  "GeoPolitics",
+        "rss": [
+            "https://feeds.reuters.com/reuters/worldNews",
+            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+            "https://www.aljazeera.com/xml/rss/all.xml",
+        ],
+        "newsapi_q": "geopolitics international relations world affairs",
+    },
+    "crypto": {
+        "emoji":  "₿",
+        "label":  "Crypto",
+        "rss": [
+            "https://cointelegraph.com/rss",
+            "https://coindesk.com/arc/outboundfeeds/rss/",
+            "https://decrypt.co/feed",
+        ],
+        "newsapi_q": "cryptocurrency bitcoin ethereum blockchain",
+    },
 }
 
-NEWSAPI_QUERIES = {
-    "🎵 TikTok Viral (USA)":        ("TikTok viral trending",  "us"),
-    "🎵 TikTok Viral (Global)":     ("TikTok viral trending",  None),
-    "📸 Instagram Viral (USA)":     ("Instagram trending viral","us"),
-    "📸 Instagram Viral (India)":   ("Instagram trending India","in"),
-    "📸 Instagram Viral (Global)":  ("Instagram trending viral",None),
-}
-
-# ── Conversation memory (per chat) ───────────────────────────────────────────
+# ── In-memory state ───────────────────────────────────────────────────────────
+todays_digest: dict = {}                  # { section_key: [article, ...] }
 conversation_history: dict[int, list] = {}
-todays_digest: dict = {}           # stored so follow-up can reference it
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEWS FETCHING
+#  FETCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_rss(url: str, max_items: int = 3) -> list[dict]:
-    """Fetch and parse an RSS feed, returning a list of article dicts."""
-    try:
-        feed = feedparser.parse(url)
-        items = []
-        for entry in feed.entries[:max_items]:
-            items.append({
-                "title":   entry.get("title", "No title"),
-                "link":    entry.get("link", ""),
-                "summary": entry.get("summary", entry.get("description", ""))[:300],
-                "image":   _extract_image(entry),
-            })
-        return items
-    except Exception as e:
-        logger.warning(f"RSS fetch failed for {url}: {e}")
-        return []
+def fetch_rss_articles(urls: list[str], max_total: int = 5) -> list[dict]:
+    articles = []
+    for url in urls:
+        if len(articles) >= max_total:
+            break
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                if len(articles) >= max_total:
+                    break
+                title = entry.get("title", "").strip()
+                link  = entry.get("link", "").strip()
+                if title and link:
+                    articles.append({"title": title, "link": link,
+                                     "summary": entry.get("summary", "")[:400]})
+        except Exception as e:
+            logger.warning(f"RSS error {url}: {e}")
+    return articles
 
 
-def _extract_image(entry) -> str | None:
-    """Try to pull a thumbnail/image URL from an RSS entry."""
-    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-        return entry.media_thumbnail[0].get("url")
-    if hasattr(entry, "links"):
-        for link in entry.links:
-            if link.get("type", "").startswith("image"):
-                return link.get("href")
-    return None
-
-
-async def fetch_newsapi(query: str, country: str | None, max_items: int = 3) -> list[dict]:
-    """Fetch top headlines from NewsAPI."""
-    params = {
-        "q":       query,
-        "apiKey":  NEWS_API_KEY,
-        "pageSize": max_items,
-        "language": "en",
-        "sortBy":  "publishedAt",
-    }
-    if country:
-        params["country"] = country
-        del params["q"]
-        params["q"] = query
-
-    url = "https://newsapi.org/v2/everything" if not country else "https://newsapi.org/v2/top-headlines"
+async def fetch_newsapi_articles(query: str, max_items: int = 5) -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, params=params)
-            data = r.json()
-        articles = []
-        for a in data.get("articles", [])[:max_items]:
-            articles.append({
-                "title":   a.get("title", ""),
+            r = await client.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "q":        query,
+                    "apiKey":   NEWS_API_KEY,
+                    "pageSize": max_items,
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                },
+            )
+        data = r.json()
+        return [
+            {
+                "title":   a.get("title", "").strip(),
                 "link":    a.get("url", ""),
-                "summary": a.get("description", "")[:300],
-                "image":   a.get("urlToImage"),
-            })
-        return articles
+                "summary": (a.get("description") or "")[:400],
+            }
+            for a in data.get("articles", [])[:max_items]
+            if a.get("title") and "[Removed]" not in a.get("title", "")
+        ]
     except Exception as e:
-        logger.warning(f"NewsAPI failed for '{query}': {e}")
+        logger.warning(f"NewsAPI error '{query}': {e}")
         return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  AI SUMMARIZATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def ai_summarize_section(section_name: str, articles: list[dict]) -> str:
-    """Use Claude to generate a crisp 2-line summary for a news section."""
-    if not articles:
-        return "No articles found for this section today."
-    
-    articles_text = "\n".join(
-        f"- {a['title']}: {a['summary']}" for a in articles
-    )
-    prompt = (
-        f"You are a sharp news editor. Given these headlines for '{section_name}', "
-        f"write a 2-sentence executive summary capturing the biggest trend or story. "
-        f"Be concise and insightful.\n\nHeadlines:\n{articles_text}"
-    )
-    try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text.strip()
-    except Exception as e:
-        logger.warning(f"Claude summarization failed: {e}")
-        return articles[0]["summary"] if articles else ""
+async def fetch_section(key: str, cfg: dict) -> list[dict]:
+    """Fetch up to 5 articles for a section, RSS first then NewsAPI fallback."""
+    articles = fetch_rss_articles(cfg["rss"], max_total=5)
+    if len(articles) < 3:
+        api_articles = await fetch_newsapi_articles(cfg["newsapi_q"], max_items=5)
+        # merge, de-duplicate by title
+        existing_titles = {a["title"] for a in articles}
+        for a in api_articles:
+            if a["title"] not in existing_titles:
+                articles.append(a)
+                existing_titles.add(a["title"])
+    return articles[:5]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DIGEST BUILDER
+#  FORMATTING  (clean numbered list, one message per section)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def build_digest() -> dict:
-    """Fetch all news and build the full digest dict."""
-    digest = {}
+def escape_md(text: str) -> str:
+    """Escape special MarkdownV2 characters."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
-    # RSS-based sections
-    for section, urls in RSS_FEEDS.items():
-        articles = []
-        for url in urls:
-            articles.extend(fetch_rss(url, max_items=2))
-            if len(articles) >= 4:
-                break
-        articles = articles[:4]
-        digest[section] = {
-            "articles": articles,
-            "summary":  ai_summarize_section(section, articles),
-        }
 
-    # NewsAPI-based sections
-    for section, (query, country) in NEWSAPI_QUERIES.items():
-        articles = await fetch_newsapi(query, country, max_items=3)
-        digest[section] = {
-            "articles": articles,
-            "summary":  ai_summarize_section(section, articles),
-        }
+def build_section_message(key: str, articles: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Returns (text, keyboard) for one section.
 
-    return digest
+    Format:
+    ────────────────────
+    🤖 *AI TECH*
+    ────────────────────
+    1. Article headline one
+    2. Article headline two
+    3. Article headline three
+    4. Article headline four
+    5. Article headline five
+
+    [ 💬 1 ] [ 💬 2 ] [ 💬 3 ] [ 💬 4 ] [ 💬 5 ]
+    [ 🔗 1 ] [ 🔗 2 ] [ 🔗 3 ] [ 🔗 4 ] [ 🔗 5 ]
+    """
+    cfg   = SECTIONS[key]
+    emoji = cfg["emoji"]
+    label = cfg["label"].upper()
+
+    divider = escape_md("―" * 22)
+    header  = f"{divider}\n{emoji} *{escape_md(label)}*\n{divider}\n\n"
+
+    lines = ""
+    for i, a in enumerate(articles, 1):
+        lines += f"{i}\\. {escape_md(a['title'])}\n"
+
+    text = header + lines
+
+    # Row 1: "Ask about #N" buttons
+    ask_row  = [
+        InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}")
+        for i in range(1, len(articles) + 1)
+    ]
+    # Row 2: "Read link #N" buttons
+    link_row = [
+        InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])
+        for i in range(1, len(articles) + 1)
+    ]
+
+    keyboard = InlineKeyboardMarkup([ask_row, link_row])
+    return text, keyboard
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM SENDING
+#  DIGEST SENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_digest(app: Application, chat_id: int):
-    """Build and send the full digest to a Telegram chat."""
     global todays_digest
 
+    # Header message
+    now_ist = datetime.utcnow()  # approx; actual IST offset handled by schedule
+    date_str = escape_md(now_ist.strftime("%A, %d %B %Y"))
     await app.bot.send_message(
         chat_id=chat_id,
         text=(
-            "🌅 *Good Morning\\! Your Daily News Digest is ready\\!*\n\n"
-            "Here's what's trending today across all your topics 👇\n"
-            "_Ask me anything about any story after the digest\\!_"
+            f"🌅 *Good Morning\\!*\n"
+            f"📅 {date_str}\n\n"
+            f"Here are your top stories for today\\.\n"
+            f"Tap 💬 on any story number to ask Claude about it\\.\n"
+            f"Tap 🔗 to read the full article\\."
         ),
-        parse_mode="MarkdownV2"
+        parse_mode="MarkdownV2",
     )
 
-    digest = await build_digest()
-    todays_digest = digest
+    todays_digest = {}
 
-    for section, data in digest.items():
-        # Section header + AI summary
-        section_safe = section.replace(".", "\\.").replace("(", "\\(").replace(")", "\\)")
-        summary_safe = (data["summary"]
-                        .replace(".", "\\.").replace("!", "\\!")
-                        .replace("(", "\\(").replace(")", "\\)")
-                        .replace("-", "\\-").replace(">", "\\>")
-                        .replace("#", "\\#"))
+    for key, cfg in SECTIONS.items():
+        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+        articles = await fetch_section(key, cfg)
+        todays_digest[key] = articles
 
-        header = f"*{section_safe}*\n_{summary_safe}_\n"
-        await app.bot.send_message(chat_id=chat_id, text=header, parse_mode="MarkdownV2")
-
-        # Individual articles
-        for idx, article in enumerate(data["articles"][:3], 1):
-            title   = article["title"] or "Untitled"
-            link    = article["link"]  or ""
-            image   = article.get("image")
-
-            btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔗 Read More", url=link),
-                InlineKeyboardButton(f"💬 Ask about this", callback_data=f"ask|{section}|{idx-1}"),
-            ]])
-
-            if image:
-                try:
-                    await app.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=image,
-                        caption=f"*{title}*",
-                        parse_mode="Markdown",
-                        reply_markup=btn,
-                    )
-                    continue
-                except Exception:
-                    pass  # fall through to text message
-
+        if not articles:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"📰 *{title}*",
-                parse_mode="Markdown",
-                reply_markup=btn,
+                text=f"{cfg['emoji']} *{escape_md(cfg['label'].upper())}*\n\n_No stories found today\\._",
+                parse_mode="MarkdownV2",
             )
+            continue
 
-    # End of digest
+        text, keyboard = build_section_message(key, articles)
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="MarkdownV2",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+    # Footer
     await app.bot.send_message(
         chat_id=chat_id,
         text=(
-            "✅ *That's your full digest for today!*\n\n"
-            "💬 You can now:\n"
-            "• Type any question about today's news\n"
-            "• Tap *'Ask about this'* on any story\n"
-            "• Use /digest to re-fetch anytime\n"
-            "• Use /help for more commands"
+            "✅ *That's your digest for today\\!*\n\n"
+            "You can also just *type any question* and I'll answer it\\."
         ),
-        parse_mode="Markdown"
+        parse_mode="MarkdownV2",
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FOLLOW-UP CHAT (Claude-powered)
+#  CLAUDE CHAT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_system_prompt() -> str:
-    """Build Claude system prompt with today's digest as context."""
-    digest_text = ""
-    for section, data in todays_digest.items():
-        digest_text += f"\n\n### {section}\nSummary: {data['summary']}\nArticles:\n"
-        for a in data["articles"]:
-            digest_text += f"  - {a['title']}: {a['summary']}\n"
-
+    context = ""
+    for key, articles in todays_digest.items():
+        cfg = SECTIONS[key]
+        context += f"\n## {cfg['emoji']} {cfg['label']}\n"
+        for i, a in enumerate(articles, 1):
+            context += f"{i}. {a['title']}\n   {a['summary']}\n"
     return (
-        "You are a sharp, friendly AI news assistant. "
-        "The user has received today's news digest (below). "
-        "Answer their follow-up questions insightfully, referencing specific stories when relevant. "
-        "Keep answers concise (3-5 sentences). If asked for deeper analysis, provide it.\n\n"
-        f"TODAY'S DIGEST CONTEXT:\n{digest_text}"
+        "You are a sharp, concise AI news analyst. "
+        "The user has received today's digest shown below. "
+        "When they ask about a story, give a 3-5 sentence insight: "
+        "what happened, why it matters, and what to watch next. "
+        "Be direct and insightful, not generic.\n\n"
+        f"TODAY'S DIGEST:\n{context}"
     )
 
 
-async def chat_with_claude(chat_id: int, user_message: str) -> str:
-    """Send a message to Claude with conversation history."""
+async def ask_claude(chat_id: int, message: str) -> str:
     if chat_id not in conversation_history:
         conversation_history[chat_id] = []
-
-    conversation_history[chat_id].append({"role": "user", "content": user_message})
-
-    # Keep last 20 messages to avoid token overflow
+    conversation_history[chat_id].append({"role": "user", "content": message})
     history = conversation_history[chat_id][-20:]
-
     try:
-        response = claude.messages.create(
+        resp = claude.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=500,
+            max_tokens=400,
             system=build_system_prompt(),
             messages=history,
         )
-        reply = response.content[0].text.strip()
+        reply = resp.content[0].text.strip()
         conversation_history[chat_id].append({"role": "assistant", "content": reply})
         return reply
     except Exception as e:
-        logger.error(f"Claude chat error: {e}")
-        return "Sorry, I had trouble thinking that through. Please try again!"
+        logger.error(f"Claude error: {e}")
+        return "Sorry, I couldn't process that. Please try again."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM HANDLERS
+#  HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"👋 *Welcome to your Personal News Digest Bot!*\n\n"
-        f"Your Chat ID is: `{chat_id}`\n\n"
-        f"📰 I'll send you a rich daily digest every morning at *7:00 AM IST*\n\n"
+        f"👋 *Welcome to your Daily News Digest Bot\\!*\n\n"
+        f"Your Chat ID: `{chat_id}`\n\n"
+        f"📰 Every morning at *7:00 AM IST* I'll send you:\n\n"
+        f"🤖 *AI Tech* — top 5 stories\n"
+        f"💰 *Finance* — top 5 stories\n"
+        f"🌍 *GeoPolitics* — top 5 stories\n"
+        f"₿  *Crypto* — top 5 stories\n\n"
         f"*Commands:*\n"
         f"/digest — Get today's digest now\n"
-        f"/topics — See what topics I cover\n"
-        f"/clear — Clear conversation history\n"
-        f"/help — Show this message\n\n"
-        f"Or just *type any question* about the news!",
-        parse_mode="Markdown"
+        f"/clear — Clear chat history\n"
+        f"/help — Show this message",
+        parse_mode="MarkdownV2",
     )
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text("⏳ Fetching your digest... this takes ~30 seconds!")
+    await update.message.reply_text("⏳ Fetching your digest\\.\\.\\. ~30 seconds", parse_mode="MarkdownV2")
     await send_digest(context.application, chat_id)
 
 
-async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 *Topics I cover daily:*\n\n"
-        "🎵 TikTok Viral — USA & Global\n"
-        "📸 Instagram Viral — USA, India & Global\n"
-        "🤖 AI & Tech Updates\n"
-        "💻 Tech Industry News\n"
-        "💰 Finance & Markets\n\n"
-        "All powered by NewsAPI + RSS + Claude AI!",
-        parse_mode="Markdown"
-    )
-
-
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    conversation_history[chat_id] = []
-    await update.message.reply_text("🧹 Conversation history cleared!")
+    conversation_history[update.effective_chat.id] = []
+    await update.message.reply_text("🧹 Conversation history cleared\\!", parse_mode="MarkdownV2")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free-text follow-up questions."""
-    chat_id  = update.effective_chat.id
-    question = update.message.text
-
+    chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await chat_with_claude(chat_id, question)
+    reply = await ask_claude(chat_id, update.message.text)
     await update.message.reply_text(reply)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle 'Ask about this' button presses."""
-    query = update.callback_query
-    await query.answer()
+    """Handle 💬 N button — ask Claude about that specific story."""
+    q = update.callback_query
+    await q.answer()
 
-    _, section, idx_str = query.data.split("|", 2)
-    idx = int(idx_str)
-
-    article = todays_digest.get(section, {}).get("articles", [])[idx] if todays_digest else None
-    if not article:
-        await query.message.reply_text("Sorry, I couldn't find that article. Try /digest to refresh.")
+    try:
+        _, section_key, idx_str = q.data.split("|")
+        idx     = int(idx_str)
+        article = todays_digest.get(section_key, [])[idx]
+    except (ValueError, IndexError):
+        await q.message.reply_text("Couldn't find that story. Try /digest to refresh.")
         return
 
+    cfg    = SECTIONS[section_key]
     prompt = (
-        f"The user wants to know more about this article:\n"
+        f"The user tapped on story #{idx+1} from the {cfg['label']} section:\n\n"
         f"Title: {article['title']}\n"
         f"Summary: {article['summary']}\n\n"
-        f"Give a helpful 3-4 sentence analysis: what this means, why it matters, and what to watch next."
+        f"Give a sharp 3-5 sentence analysis: what happened, why it matters, and what to watch next."
     )
+
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await chat_with_claude(chat_id, prompt)
-    await query.message.reply_text(f"💡 *Analysis:*\n\n{reply}", parse_mode="Markdown")
+    reply = await ask_claude(chat_id, prompt)
+
+    # Show which story they asked about, then the analysis
+    story_ref = escape_md(f"{cfg['emoji']} {cfg['label']} #{idx+1}: {article['title']}")
+    await q.message.reply_text(
+        f"_{story_ref}_\n\n{escape_md(reply)}",
+        parse_mode="MarkdownV2",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCHEDULER
+#  SCHEDULER + MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
-    """Job that runs daily at 7 AM IST."""
-    await send_digest(context.application, int(TELEGRAM_CHAT_ID))
+    await send_digest(context.application, TELEGRAM_CHAT_ID)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("digest", cmd_digest))
-    app.add_handler(CommandHandler("topics", cmd_topics))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(CommandHandler("help",   cmd_start))
+    app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily job at 7:00 AM IST = 01:30 UTC
-    job_queue = app.job_queue
-    job_queue.run_daily(
+    # 7:00 AM IST = 01:30 UTC
+    app.job_queue.run_daily(
         scheduled_digest,
-        time=datetime.strptime("01:30", "%H:%M").time(),  # 7:00 AM IST
+        time=datetime.strptime("01:30", "%H:%M").time(),
         name="daily_digest",
     )
 
-    logger.info("🤖 News Digest Bot is running...")
+    logger.info("🤖 News Digest Bot v2 is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
