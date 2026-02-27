@@ -467,8 +467,19 @@ async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
     await send_digest(context.application, TELEGRAM_CHAT_ID)
 
 
+async def post_init(app: Application):
+    """Called once on startup — clears any existing webhook/session so no 409 conflicts."""
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Webhook deleted, pending updates cleared — safe to poll.")
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_start))
@@ -486,7 +497,10 @@ def main():
     )
 
     logger.info("🤖 News Digest Bot v2 is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # ← clears any queued updates from old instances
+    )
 
 
 if __name__ == "__main__":
