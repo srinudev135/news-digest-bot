@@ -11,9 +11,11 @@ import os
 import re
 import html
 import logging
+import tempfile
 import feedparser
 import httpx
 from datetime import datetime
+from gtts import gTTS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -89,6 +91,7 @@ SECTIONS = {
 # ── In-memory state ───────────────────────────────────────────────────────────
 todays_digest: dict = {}                  # { section_key: [article, ...] }
 conversation_history: dict[int, list] = {}
+last_reply: dict[int, str] = {}           # { chat_id: last Telugu reply text }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -353,18 +356,55 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Conversation history cleared!")
 
 
+async def send_reply_with_audio_btn(update: Update, chat_id: int, reply: str):
+    """Send Claude's Telugu reply with a 🔊 listen button below it."""
+    last_reply[chat_id] = reply
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔊 తెలుగులో వినండి", callback_data="tts")
+    ]])
+    await update.message.reply_text(reply, reply_markup=keyboard)
+
+
+async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Convert last Telugu reply to audio and send as voice message."""
+    q       = update.callback_query
+    chat_id = update.effective_chat.id
+    await q.answer("🔊 ఆడియో తయారవుతోంది...")
+
+    text = last_reply.get(chat_id)
+    if not text:
+        await q.message.reply_text("మళ్ళీ ప్రశ్న అడగండి, తర్వాత 🔊 నొక్కండి.")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+
+    try:
+        tts = gTTS(text=text, lang="te", slow=False)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tts.save(f.name)
+            tmp_path = f.name
+
+        with open(tmp_path, "rb") as audio:
+            await context.bot.send_voice(chat_id=chat_id, voice=audio)
+
+        os.unlink(tmp_path)   # clean up temp file
+
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        await q.message.reply_text("ఆడియో తయారు చేయడంలో సమస్య వచ్చింది. మళ్ళీ ప్రయత్నించండి.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id     = update.effective_chat.id
-    user_text   = update.message.text
-    pending     = context.user_data.get("pending_story")
+    chat_id   = update.effective_chat.id
+    user_text = update.message.text
+    pending   = context.user_data.get("pending_story")
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     if pending:
-        # User is answering a follow-up prompt about a specific story
         section_key = pending["section_key"]
         idx         = pending["idx"]
-        context.user_data.pop("pending_story")   # clear it
+        context.user_data.pop("pending_story")
 
         article = todays_digest.get(section_key, [])[idx] if todays_digest else None
         cfg     = SECTIONS.get(section_key, {})
@@ -382,12 +422,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reply = await ask_claude(chat_id, user_text)
 
-        await update.message.reply_text(reply)
+        await send_reply_with_audio_btn(update, chat_id, reply)
 
     else:
-        # Normal free-text question
         reply = await ask_claude(chat_id, user_text)
-        await update.message.reply_text(reply)
+        await send_reply_with_audio_btn(update, chat_id, reply)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -435,7 +474,8 @@ def main():
     app.add_handler(CommandHandler("help",   cmd_start))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("clear",  cmd_clear))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(handle_tts,      pattern="^tts$"))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern="^ask\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 7:00 AM IST = 01:30 UTC
