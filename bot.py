@@ -157,23 +157,52 @@ async def fetch_section(key: str, cfg: dict) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TELUGU TRANSLATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def translate_headlines_to_telugu(section_label: str, articles: list[dict]) -> list[str]:
+    """Use Claude to translate all headlines in a section to Telugu in one call."""
+    if not articles:
+        return []
+    numbered = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
+    prompt = (
+        f"Translate these {section_label} news headlines to Telugu. "
+        f"Return ONLY the numbered translations, one per line, same numbering. "
+        f"Keep proper nouns (company names, people, places) in English within the Telugu text. "
+        f"Do not add any extra commentary.\n\n{numbered}"
+    )
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        lines = resp.content[0].text.strip().split("\n")
+        # Strip numbering like "1. " from each line
+        translations = []
+        for line in lines:
+            line = line.strip()
+            if line:
+                # Remove leading "1. " "2. " etc
+                import re
+                cleaned = re.sub(r"^\d+\.\s*", "", line)
+                translations.append(cleaned)
+        # Pad with original titles if translation came back short
+        while len(translations) < len(articles):
+            translations.append(articles[len(translations)]["title"])
+        return translations[:len(articles)]
+    except Exception as e:
+        logger.warning(f"Telugu translation failed: {e}")
+        return [a["title"] for a in articles]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FORMATTING  (clean numbered list, one message per section)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_section_message(key: str, articles: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+def build_section_message(key: str, articles: list[dict], telugu_titles: list[str]) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Returns (HTML text, keyboard) for one section.
-
-    Format:
-    ――――――――――――――――――――――
-    🤖 <b>AI TECH</b>
-    ――――――――――――――――――――――
-    1. Article headline one
-    2. Article headline two
-    ...
-
-    [ 💬 1 ][ 💬 2 ][ 💬 3 ][ 💬 4 ][ 💬 5 ]
-    [ 🔗 1 ][ 🔗 2 ][ 🔗 3 ][ 🔗 4 ][ 🔗 5 ]
+    Returns (HTML text, keyboard) for one section with Telugu headlines.
     """
     cfg     = SECTIONS[key]
     emoji   = cfg["emoji"]
@@ -181,8 +210,8 @@ def build_section_message(key: str, articles: list[dict]) -> tuple[str, InlineKe
     divider = "―" * 22
 
     lines = ""
-    for i, a in enumerate(articles, 1):
-        lines += f"{i}. {h(a['title'])}\n"
+    for i, title in enumerate(telugu_titles, 1):
+        lines += f"{i}. {h(title)}\n"
 
     text = f"{divider}\n{emoji} <b>{h(label)}</b>\n{divider}\n\n{lines}"
 
@@ -212,11 +241,11 @@ async def send_digest(app: Application, chat_id: int):
     await app.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🌅 <b>Good Morning!</b>\n"
+            f"🌅 <b>శుభోదయం!</b>\n"
             f"📅 {h(date_str)}\n\n"
-            f"Here are your top stories for today.\n"
-            f"Tap 💬 on any story number to ask Claude about it.\n"
-            f"Tap 🔗 to read the full article."
+            f"ఈరోజు మీ ముఖ్యమైన వార్తలు ఇక్కడ ఉన్నాయి.\n"
+            f"ఏదైనా వార్త గురించి అడగాలంటే 💬 నొక్కండి.\n"
+            f"పూర్తి వ్యాసం చదవాలంటే 🔗 నొక్కండి."
         ),
         parse_mode="HTML",
     )
@@ -231,12 +260,15 @@ async def send_digest(app: Application, chat_id: int):
         if not articles:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"{cfg['emoji']} <b>{h(cfg['label'].upper())}</b>\n\n<i>No stories found today.</i>",
+                text=f"{cfg['emoji']} <b>{h(cfg['label'].upper())}</b>\n\n<i>నేడు వార్తలు అందుబాటులో లేవు.</i>",
                 parse_mode="HTML",
             )
             continue
 
-        text, keyboard = build_section_message(key, articles)
+        # Translate headlines to Telugu
+        telugu_titles = translate_headlines_to_telugu(cfg["label"], articles)
+
+        text, keyboard = build_section_message(key, articles, telugu_titles)
         await app.bot.send_message(
             chat_id=chat_id,
             text=text,
@@ -247,7 +279,7 @@ async def send_digest(app: Application, chat_id: int):
 
     await app.bot.send_message(
         chat_id=chat_id,
-        text="✅ <b>That's your digest for today!</b>\n\nYou can also just <i>type any question</i> and I'll answer it.",
+        text="✅ <b>ఈరోజు వార్తలు పూర్తయ్యాయి!</b>\n\nఏదైనా ప్రశ్న అడగాలంటే నేరుగా టైప్ చేయండి — నేను తెలుగులో జవాబిస్తాను.",
         parse_mode="HTML",
     )
 
@@ -264,12 +296,13 @@ def build_system_prompt() -> str:
         for i, a in enumerate(articles, 1):
             context += f"{i}. {a['title']}\n   {a['summary']}\n"
     return (
-        "You are a sharp, concise AI news analyst. "
-        "The user has received today's digest shown below. "
-        "When they ask about a story, give a 3-5 sentence insight: "
-        "what happened, why it matters, and what to watch next. "
-        "Be direct and insightful, not generic.\n\n"
-        f"TODAY'S DIGEST:\n{context}"
+        "మీరు ఒక తెలివైన, సంక్షిప్త AI వార్తల విశ్లేషకుడు. "
+        "వినియోగదారుడు నేటి వార్తల సారాంశం చదివారు. "
+        "వారు ఏదైనా వార్త గురించి అడిగినప్పుడు, తెలుగులో 3-5 వాక్యాల విశ్లేషణ ఇవ్వండి: "
+        "ఏమి జరిగింది, ఎందుకు ముఖ్యమైనది, మరియు తదుపరి ఏమి చూడాలి. "
+        "ప్రత్యక్షంగా మరియు అంతర్దృష్టితో ఉండండి. "
+        "సంస్థల పేర్లు, వ్యక్తుల పేర్లు ఆంగ్లంలోనే ఉంచండి.\n\n"
+        f"నేటి వార్తలు:\n{context}"
     )
 
 
@@ -290,7 +323,7 @@ async def ask_claude(chat_id: int, message: str) -> str:
         return reply
     except Exception as e:
         logger.error(f"Claude error: {e}")
-        return "Sorry, I couldn't process that. Please try again."
+        return "క్షమించండి, నేను దాన్ని ప్రాసెస్ చేయలేకపోయాను. దయచేసి మళ్ళీ ప్రయత్నించండి."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
