@@ -640,7 +640,30 @@ async def post_init(app: Application):
     reschedule_jobs(app)
 
 
+async def run_send_digest_only():
+    """
+    One-shot mode: build app, send digest, then exit.
+    Used by digest.yml GitHub Action — completes in ~2 minutes, never times out.
+    """
+    import asyncio
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    await app.initialize()
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("📰 One-shot digest mode — sending now...")
+    await send_digest(app, TELEGRAM_CHAT_ID)
+    await app.shutdown()
+    logger.info("✅ Digest sent — exiting cleanly.")
+
+
 def main():
+    import sys
+    # ── One-shot digest mode (called by digest.yml at 7 AM) ──
+    if "--send-digest" in sys.argv:
+        import asyncio
+        asyncio.run(run_send_digest_only())
+        return
+
+    # ── Interactive polling mode (called by bot.yml for follow-up chat) ──
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -658,7 +681,7 @@ def main():
                     pattern="^(set_|topic_|edit_time|add_time|remove_time|set_count)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 News Digest Bot v4 running...")
+    logger.info("🤖 News Digest Bot v4 running in polling mode...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
