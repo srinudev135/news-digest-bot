@@ -1,27 +1,27 @@
-name: News Digest Telegram Bot
+name: Daily News Digest (7 AM IST)
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:        # manual trigger from GitHub UI
   schedule:
-    - cron: "30 1 * * *"   # 7:00 AM IST = 01:30 UTC — triggers digest directly too
+    - cron: "30 1 * * *"   # 7:00 AM IST = 01:30 UTC
+  workflow_dispatch:        # manual trigger for testing
+
+concurrency:
+  group: digest-job
+  cancel-in-progress: true
 
 jobs:
-  run-bot:
+  send-digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60      # runs for up to 1 hour (keeps polling alive)
+    timeout-minutes: 10     # digest sends in ~2 mins, 10 is generous safety buffer
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip packages
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -30,10 +30,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run News Digest Bot
+      - name: Send digest and exit
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           NEWS_API_KEY:       ${{ secrets.NEWS_API_KEY }}
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python bot.py
+        run: python bot.py --send-digest   # ← one-shot mode, exits after sending
