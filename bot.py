@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Daily News Digest Telegram Bot v4
-- Topics are user-defined: type any phrase, Claude auto-generates search queries
-- Only GeoPolitics by default
-- Settings: delivery times, add/remove topics, news count
-- Telugu translation + audio playback
+Daily News Digest Telegram Bot v5
+Fixes:
+  1. Correct 7 AM IST timing (UTC+5:30 = 01:30 UTC)
+  2. Settings persisted to settings.json — survive restarts
+  3. Single workflow: sends digest at startup + stays alive for interactive chat
+  4. Default topics: GeoPolitics, Finance, AI Updates, Crypto
 """
 
-import os, re, html, logging, tempfile, feedparser, httpx
+import os, re, html, json, logging, tempfile, asyncio, feedparser, httpx
 from datetime import datetime, time as dtime
+from pathlib import Path
 from gtts import gTTS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,33 +30,93 @@ claude             = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def h(t): return html.escape(str(t))
 
+SETTINGS_FILE = Path("settings.json")
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  DYNAMIC TOPIC STORE
-#  Each topic is user-defined. Claude generates emoji, label, newsapi_q on add.
-#  Structure: { "key": { "emoji", "label", "newsapi_q" } }
+#  DEFAULT TOPICS  (4 built-in)
 # ══════════════════════════════════════════════════════════════════════════════
-BUILTIN_GEOPOLITICS = {
-    "emoji":     "🌍",
-    "label":     "GeoPolitics",
-    "newsapi_q": "geopolitics international relations world affairs",
-    "rss": [
-        "https://feeds.reuters.com/reuters/worldNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        "https://www.aljazeera.com/xml/rss/all.xml",
-    ],
+DEFAULT_TOPICS = {
+    "geopolitics": {
+        "emoji": "🌍", "label": "GeoPolitics",
+        "newsapi_q": "geopolitics international relations world affairs",
+        "rss": [
+            "https://feeds.reuters.com/reuters/worldNews",
+            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+            "https://www.aljazeera.com/xml/rss/all.xml",
+        ],
+    },
+    "finance": {
+        "emoji": "💰", "label": "Finance",
+        "newsapi_q": "finance markets economy stocks",
+        "rss": [
+            "https://feeds.reuters.com/reuters/businessNews",
+            "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+            "https://feeds.finance.yahoo.com/rss/2.0/headline",
+        ],
+    },
+    "ai_updates": {
+        "emoji": "🤖", "label": "AI Updates",
+        "newsapi_q": "artificial intelligence machine learning OpenAI Google",
+        "rss": [
+            "https://techcrunch.com/category/artificial-intelligence/feed/",
+            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+            "https://feeds.feedburner.com/venturebeat/SZYF",
+        ],
+    },
+    "crypto": {
+        "emoji": "₿", "label": "Crypto",
+        "newsapi_q": "cryptocurrency bitcoin ethereum blockchain",
+        "rss": [
+            "https://cointelegraph.com/rss",
+            "https://coindesk.com/arc/outboundfeeds/rss/",
+            "https://decrypt.co/feed",
+        ],
+    },
 }
 
-# Runtime topic store — starts with only GeoPolitics
-topics: dict = {"geopolitics": BUILTIN_GEOPOLITICS}
-
-# User settings
-settings: dict = {
-    "delivery_times": ["07:00"],        # IST, max 2
-    "active_topics":  ["geopolitics"],  # keys in `topics`
+DEFAULT_SETTINGS = {
+    "delivery_times": ["07:00"],
+    "active_topics":  ["geopolitics", "finance", "ai_updates", "crypto"],
     "news_count":     5,
 }
 
-# In-memory state
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERSISTENT SETTINGS  — saved to settings.json, survives restarts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_settings() -> tuple[dict, dict]:
+    """Load topics + settings from file, falling back to defaults."""
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text())
+            loaded_topics   = data.get("topics",   DEFAULT_TOPICS.copy())
+            loaded_settings = data.get("settings", DEFAULT_SETTINGS.copy())
+            # Ensure all default topics exist (in case new defaults were added)
+            for k, v in DEFAULT_TOPICS.items():
+                if k not in loaded_topics:
+                    loaded_topics[k] = v
+            logger.info(f"✅ Settings loaded from {SETTINGS_FILE}")
+            return loaded_topics, loaded_settings
+        except Exception as ex:
+            logger.warning(f"Settings load failed ({ex}), using defaults.")
+    return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
+
+
+def save_settings():
+    """Persist current topics + settings to file."""
+    try:
+        SETTINGS_FILE.write_text(json.dumps(
+            {"topics": topics, "settings": settings}, indent=2, ensure_ascii=False
+        ))
+        logger.info("💾 Settings saved.")
+    except Exception as ex:
+        logger.error(f"Settings save failed: {ex}")
+
+
+# Load on startup
+topics, settings = load_settings()
+
+# ── In-memory state ───────────────────────────────────────────────────────────
 todays_digest:        dict            = {}
 conversation_history: dict[int, list] = {}
 last_reply:           dict[int, str]  = {}
@@ -65,37 +127,26 @@ last_reply:           dict[int, str]  = {}
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def generate_topic_config(user_phrase: str) -> dict | None:
-    """
-    Given a free-text phrase like 'cricket news' or 'Indian stock market',
-    ask Claude to return a JSON config for that topic.
-    """
-    prompt = f"""The user wants to add a news topic called: "{user_phrase}"
+    prompt = f"""The user wants to add a news topic: "{user_phrase}"
 
-Return a JSON object with these exact keys:
-- key: a short snake_case identifier (e.g. "cricket", "indian_stocks")
-- label: a clean display name (e.g. "Cricket", "Indian Stocks")
+Return a JSON object with ONLY these keys:
+- key: short snake_case id (e.g. "cricket")
+- label: clean display name (e.g. "Cricket")
 - emoji: one relevant emoji
-- newsapi_q: a good NewsAPI search query string (5-8 words) to find relevant news
-- rss: a JSON array of 2-3 reliable public RSS feed URLs for this topic
+- newsapi_q: NewsAPI search query (5-8 words)
+- rss: array of 2-3 reliable public RSS feed URLs
 
-Reply with ONLY the raw JSON, no markdown, no explanation."""
-
+Reply with ONLY raw JSON, no markdown fences."""
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=400,
+            model="claude-sonnet-4-20250514", max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = resp.content[0].text.strip()
-        # Strip markdown code fences if present
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        import json
+        raw = re.sub(r"^```[a-z]*\n?|\n?```$", "", resp.content[0].text.strip())
         cfg = json.loads(raw)
-        # Validate required keys
         for k in ("key", "label", "emoji", "newsapi_q", "rss"):
             if k not in cfg:
-                raise ValueError(f"Missing key: {k}")
+                raise ValueError(f"Missing: {k}")
         return cfg
     except Exception as ex:
         logger.error(f"Topic generation failed: {ex}")
@@ -155,7 +206,7 @@ async def fetch_section(key: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELUGU TRANSLATION + SECTION BUILDER
+#  TELUGU SECTION BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def build_telugu_section(key: str, articles: list) -> tuple:
@@ -163,13 +214,12 @@ async def build_telugu_section(key: str, articles: list) -> tuple:
     label   = cfg["label"].upper()
     divider = "―" * 22
     english = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
-
     try:
         resp = claude.messages.create(
             model="claude-sonnet-4-20250514", max_tokens=800,
             messages=[{"role": "user", "content":
                 f"Translate these news headlines to Telugu. "
-                f"Reply with ONLY the numbered Telugu translations. "
+                f"Reply with ONLY numbered Telugu translations. "
                 f"Keep company names and people names in English.\n\n{english}"
             }],
         )
@@ -226,7 +276,7 @@ async def send_digest(app: Application, chat_id: int):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def settings_text() -> str:
-    t = settings["delivery_times"]
+    t          = settings["delivery_times"]
     times_str  = "  &  ".join(t) if t else "Not set"
     topics_str = "\n".join(
         f"  {topics[k]['emoji']} {topics[k]['label']}"
@@ -256,8 +306,6 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
 
 
-# ── Times menu ────────────────────────────────────────────────────────────────
-
 def times_menu_kb() -> InlineKeyboardMarkup:
     t  = settings["delivery_times"]
     t1 = t[0] if len(t) > 0 else "Not set"
@@ -272,23 +320,18 @@ def times_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ── Topics menu — dynamic, user-defined ──────────────────────────────────────
-
 def topics_menu_kb() -> InlineKeyboardMarkup:
     rows = []
     for key, cfg in topics.items():
         active = key in settings["active_topics"]
         icon   = "✅" if active else "⬜"
-        action = f"topic_toggle|{key}"
-        rows.append([InlineKeyboardButton(f"{icon} {cfg['emoji']} {cfg['label']}", callback_data=action)])
-        if active:
+        rows.append([InlineKeyboardButton(f"{icon} {cfg['emoji']} {cfg['label']}", callback_data=f"topic_toggle|{key}")])
+        if key not in DEFAULT_TOPICS:   # only allow deleting user-added topics
             rows.append([InlineKeyboardButton(f"🗑 Remove {cfg['label']}", callback_data=f"topic_delete|{key}")])
     rows.append([InlineKeyboardButton("➕ Add new topic...", callback_data="topic_add_new")])
     rows.append([InlineKeyboardButton("« Back", callback_data="set_back")])
     return InlineKeyboardMarkup(rows)
 
-
-# ── Count menu ────────────────────────────────────────────────────────────────
 
 def count_menu_kb() -> InlineKeyboardMarkup:
     counts = [3, 4, 5, 6, 7, 8, 10]
@@ -297,88 +340,68 @@ def count_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([row, [InlineKeyboardButton("« Back", callback_data="set_back")]])
 
 
-# ── Master settings callback ──────────────────────────────────────────────────
-
 async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
     data = q.data
     await q.answer()
 
     if data == "set_close":
-        await q.message.delete()
-        return
+        await q.message.delete(); return
 
     if data == "set_back":
-        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
-        return
+        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
 
-    # ── Times ──
+    # Times
     if data == "set_times_menu":
-        await q.message.edit_text("⏰ <b>Delivery Times</b>\n\nIST, 24h format (e.g. 06:00, 18:30):",
-                                  parse_mode="HTML", reply_markup=times_menu_kb())
-        return
+        await q.message.edit_text("⏰ <b>Delivery Times</b>\n\nIST, 24h format:", parse_mode="HTML", reply_markup=times_menu_kb()); return
 
     if data == "add_time":
         if len(settings["delivery_times"]) < 2:
-            settings["delivery_times"].append("18:00")
-        await q.message.edit_text("⏰ <b>Delivery Times</b>\n\nIST, 24h format:",
-                                  parse_mode="HTML", reply_markup=times_menu_kb())
-        return
+            settings["delivery_times"].append("18:00"); save_settings()
+        await q.message.edit_text("⏰ <b>Delivery Times</b>", parse_mode="HTML", reply_markup=times_menu_kb()); return
 
     if data == "remove_time":
         if len(settings["delivery_times"]) > 1:
-            settings["delivery_times"].pop(1)
-        await q.message.edit_text("⏰ <b>Delivery Times</b>\n\nIST, 24h format:",
-                                  parse_mode="HTML", reply_markup=times_menu_kb())
-        return
+            settings["delivery_times"].pop(1); save_settings()
+        await q.message.edit_text("⏰ <b>Delivery Times</b>", parse_mode="HTML", reply_markup=times_menu_kb()); return
 
     if data.startswith("edit_time|"):
         idx = int(data.split("|")[1])
         context.user_data["editing_time_idx"] = idx
         cur = settings["delivery_times"][idx] if idx < len(settings["delivery_times"]) else "07:00"
         await q.message.reply_text(
-            f"⏰ Time {idx+1} కి కొత్త సమయం టైప్ చేయండి (<b>HH:MM</b> format, 24h IST)\n"
+            f"⏰ Time {idx+1} కి కొత్త సమయం టైప్ చేయండి (<b>HH:MM</b>, 24h IST)\n"
             f"ఉదా: <code>06:00</code> లేదా <code>18:30</code>\n\nప్రస్తుతం: <b>{cur}</b>",
-            parse_mode="HTML")
-        return
+            parse_mode="HTML"); return
 
-    # ── Topics ──
+    # Topics
     if data == "set_topics_menu":
         await q.message.edit_text(
-            "📋 <b>Topics</b>\n\n"
-            "✅ = active  |  ⬜ = inactive (tap to toggle)\n"
-            "➕ Add new topic by typing any phrase",
-            parse_mode="HTML", reply_markup=topics_menu_kb())
-        return
+            "📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive (tap to toggle)",
+            parse_mode="HTML", reply_markup=topics_menu_kb()); return
 
     if data.startswith("topic_toggle|"):
         key = data.split("|")[1]
         if key in settings["active_topics"]:
             if len(settings["active_topics"]) <= 1:
-                await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True)
-                return
+                await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True); return
             settings["active_topics"].remove(key)
         else:
             settings["active_topics"].append(key)
-        await q.message.edit_text(
-            "📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive",
-            parse_mode="HTML", reply_markup=topics_menu_kb())
-        return
+        save_settings()
+        await q.message.edit_text("📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive",
+                                  parse_mode="HTML", reply_markup=topics_menu_kb()); return
 
     if data.startswith("topic_delete|"):
         key = data.split("|")[1]
-        if key == "geopolitics":
-            await q.answer("Default topic తొలగించలేరు.", show_alert=True)
-            return
+        if key in DEFAULT_TOPICS:
+            await q.answer("Default topic తొలగించలేరు.", show_alert=True); return
         if len(settings["active_topics"]) <= 1 and key in settings["active_topics"]:
-            await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True)
-            return
+            await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True); return
         topics.pop(key, None)
         settings["active_topics"] = [k for k in settings["active_topics"] if k != key]
-        await q.message.edit_text(
-            "📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive",
-            parse_mode="HTML", reply_markup=topics_menu_kb())
-        return
+        save_settings()
+        await q.message.edit_text("📋 <b>Topics</b>", parse_mode="HTML", reply_markup=topics_menu_kb()); return
 
     if data == "topic_add_new":
         context.user_data["adding_topic"] = True
@@ -389,32 +412,29 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
             "• <code>Cricket news</code>\n"
             "• <code>Indian stock market</code>\n"
             "• <code>Bollywood</code>\n"
-            "• <code>Tesla and EV news</code>\n"
             "• <code>Climate change</code>\n\n"
-            "మీరు టైప్ చేసిన దాన్ని బట్టి AI అన్నీ automatically సెటప్ చేస్తుంది! 🤖",
-            parse_mode="HTML")
-        return
+            "AI అన్నీ automatically సెటప్ చేస్తుంది! 🤖",
+            parse_mode="HTML"); return
 
-    # ── Count ──
+    # Count
     if data == "set_count_menu":
         await q.message.edit_text(
-            f"🔢 <b>News per Topic</b>\n\nప్రస్తుతం: <b>{settings['news_count']}</b>\nకొత్త సంఖ్య ఎంచుకోండి:",
-            parse_mode="HTML", reply_markup=count_menu_kb())
-        return
+            f"🔢 <b>News per Topic</b>\n\nప్రస్తుతం: <b>{settings['news_count']}</b>",
+            parse_mode="HTML", reply_markup=count_menu_kb()); return
 
     if data.startswith("set_count|"):
         settings["news_count"] = int(data.split("|")[1])
-        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
-        return
+        save_settings()
+        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCHEDULE MANAGEMENT
+#  SCHEDULE  — 7 AM IST = 01:30 UTC
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ist_to_utc(ist_str: str) -> dtime:
     hh, mm = map(int, ist_str.split(":"))
-    total  = (hh * 60 + mm - 330) % (24 * 60)
+    total  = (hh * 60 + mm - 330) % (24 * 60)   # IST = UTC + 5h30m
     return dtime(hour=total // 60, minute=total % 60)
 
 
@@ -423,10 +443,16 @@ def reschedule_jobs(app: Application):
         job.schedule_removal()
     for ist_time in settings["delivery_times"]:
         try:
-            app.job_queue.run_daily(scheduled_digest, time=ist_to_utc(ist_time), name="daily_digest")
-            logger.info(f"Scheduled digest at {ist_time} IST")
+            utc_t = ist_to_utc(ist_time)
+            app.job_queue.run_daily(scheduled_digest, time=utc_t, name="daily_digest")
+            logger.info(f"⏰ Scheduled digest: {ist_time} IST = {utc_t} UTC")
         except Exception as ex:
             logger.error(f"Schedule error {ist_time}: {ex}")
+
+
+async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("📰 Sending scheduled digest...")
+    await send_digest(context.application, TELEGRAM_CHAT_ID)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,7 +467,7 @@ def build_system_prompt() -> str:
         for i, a in enumerate(arts, 1):
             ctx += f"{i}. {a['title']}\n   {a['summary']}\n"
     return (
-        "మీరు ఒక తెలివైన, సంక్షిప్త AI వార్తల విశ్లేషకుడు. "
+        "మీరు ఒక తెలివైన AI వార్తల విశ్లేషకుడు. "
         "తెలుగులో 3-5 వాక్యాల విశ్లేషణ ఇవ్వండి. "
         "సంస్థల పేర్లు, వ్యక్తుల పేర్లు ఆంగ్లంలోనే ఉంచండి.\n\n"
         f"నేటి వార్తలు:\n{ctx}"
@@ -508,8 +534,7 @@ async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer("🔊 ఆడియో తయారవుతోంది...")
     text = last_reply.get(chat_id)
     if not text:
-        await q.message.reply_text("మళ్ళీ ప్రశ్న అడగండి, తర్వాత 🔊 నొక్కండి.")
-        return
+        await q.message.reply_text("మళ్ళీ ప్రశ్న అడగండి, తర్వాత 🔊 నొక్కండి."); return
     await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
     try:
         tts = gTTS(text=text, lang="te", slow=False)
@@ -532,57 +557,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # ── Adding a new topic ──
+    # Adding new topic
     if adding:
         context.user_data.pop("adding_topic")
         await update.message.reply_text(
-            f"🤖 <b>\"{h(user_text)}\"</b> కోసం topic తయారు చేస్తున్నాను...\n"
-            f"ఇది 10-15 సెకన్లు పట్టవచ్చు.",
+            f"🤖 <b>\"{h(user_text)}\"</b> కోసం topic తయారు చేస్తున్నాను...\n10-15 సెకన్లు పట్టవచ్చు.",
             parse_mode="HTML")
         cfg = await generate_topic_config(user_text)
         if not cfg:
-            await update.message.reply_text(
-                "❌ Topic తయారు చేయడంలో సమస్య వచ్చింది. మళ్ళీ ప్రయత్నించండి.")
-            return
+            await update.message.reply_text("❌ Topic తయారు చేయడంలో సమస్య. మళ్ళీ ప్రయత్నించండి."); return
         key = cfg["key"]
-        # Avoid key collision
         if key in topics:
             key = key + "_2"
-        topics[key] = {
-            "emoji":     cfg["emoji"],
-            "label":     cfg["label"],
-            "newsapi_q": cfg["newsapi_q"],
-            "rss":       cfg.get("rss", []),
-        }
+        topics[key] = {"emoji": cfg["emoji"], "label": cfg["label"],
+                       "newsapi_q": cfg["newsapi_q"], "rss": cfg.get("rss", [])}
         settings["active_topics"].append(key)
+        save_settings()
         await update.message.reply_text(
-            f"✅ <b>{cfg['emoji']} {h(cfg['label'])}</b> topic జోడించబడింది!\n\n"
-            f"తదుపరి digest నుండి ఈ వార్తలు వస్తాయి.\n"
-            f"ఇప్పుడే చూడాలంటే /digest పంపండి.",
+            f"✅ <b>{cfg['emoji']} {h(cfg['label'])}</b> topic జోడించబడింది!\n"
+            f"తదుపరి digest నుండి వస్తాయి. ఇప్పుడే చూడాలంటే /digest పంపండి.",
             parse_mode="HTML")
-        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
-        return
+        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
 
-    # ── Editing a delivery time ──
+    # Editing delivery time
     if editing is not None:
         context.user_data.pop("editing_time_idx")
         m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", user_text)
         if not m:
             await update.message.reply_text(
                 "❌ Format తప్పు. <code>HH:MM</code> format లో ఇవ్వండి\nఉదా: <code>06:00</code>",
-                parse_mode="HTML")
-            return
+                parse_mode="HTML"); return
         while len(settings["delivery_times"]) <= editing:
             settings["delivery_times"].append("07:00")
         settings["delivery_times"][editing] = user_text
+        save_settings()
         reschedule_jobs(context.application)
         await update.message.reply_text(
             f"✅ Delivery time {editing+1} → <b>{user_text} IST</b> గా మార్చబడింది!",
             parse_mode="HTML")
-        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
-        return
+        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
 
-    # ── Story follow-up ──
+    # Story follow-up
     if pending:
         section_key = pending["section_key"]
         idx         = pending["idx"]
@@ -593,16 +608,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt = (
                 f"User is asking about: {cfg.get('label','')} story #{idx+1}\n"
                 f"Title: {article['title']}\nSummary: {article['summary']}\n\n"
-                f"Question: {user_text}\n\n"
-                f"Answer in Telugu, 3-5 sentences. Keep names in English."
+                f"Question: {user_text}\n\nAnswer in Telugu, 3-5 sentences. Keep names in English."
             )
             reply = await ask_claude(chat_id, prompt)
         else:
             reply = await ask_claude(chat_id, user_text)
-        await send_reply_with_audio_btn(update, chat_id, reply)
-        return
+        await send_reply_with_audio_btn(update, chat_id, reply); return
 
-    # ── Normal question ──
+    # Normal question
     reply = await ask_claude(chat_id, user_text)
     await send_reply_with_audio_btn(update, chat_id, reply)
 
@@ -615,8 +628,7 @@ async def handle_story_callback(update: Update, context: ContextTypes.DEFAULT_TY
         idx     = int(idx_str)
         article = todays_digest.get(section_key, [])[idx]
     except (ValueError, IndexError):
-        await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి.")
-        return
+        await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి."); return
     cfg = topics.get(section_key, {})
     context.user_data["pending_story"] = {"section_key": section_key, "idx": idx}
     await q.message.reply_text(
@@ -627,43 +639,19 @@ async def handle_story_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCHEDULER + MAIN
+#  MAIN — single workflow, sends digest at startup then stays alive for chat
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
-    await send_digest(context.application, TELEGRAM_CHAT_ID)
-
 
 async def post_init(app: Application):
     await app.bot.delete_webhook(drop_pending_updates=True)
     logger.info("✅ Webhook cleared.")
     reschedule_jobs(app)
-
-
-async def run_send_digest_only():
-    """
-    One-shot mode: build app, send digest, then exit.
-    Used by digest.yml GitHub Action — completes in ~2 minutes, never times out.
-    """
-    import asyncio
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    await app.initialize()
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("📰 One-shot digest mode — sending now...")
+    # Send digest immediately on startup (GitHub Action triggers at 7 AM IST)
+    logger.info("📰 Sending startup digest...")
     await send_digest(app, TELEGRAM_CHAT_ID)
-    await app.shutdown()
-    logger.info("✅ Digest sent — exiting cleanly.")
 
 
 def main():
-    import sys
-    # ── One-shot digest mode (called by digest.yml at 7 AM) ──
-    if "--send-digest" in sys.argv:
-        import asyncio
-        asyncio.run(run_send_digest_only())
-        return
-
-    # ── Interactive polling mode (called by bot.yml for follow-up chat) ──
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -681,7 +669,7 @@ def main():
                     pattern="^(set_|topic_|edit_time|add_time|remove_time|set_count)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 News Digest Bot v4 running in polling mode...")
+    logger.info("🤖 Bot running — polling for messages...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
