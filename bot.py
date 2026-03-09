@@ -206,35 +206,15 @@ async def fetch_section(key: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELUGU SECTION BUILDER
+#  SECTION BUILDER  (English titles, Telugu follow-up answers)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def build_telugu_section(key: str, articles: list) -> tuple:
     cfg     = topics[key]
     label   = cfg["label"].upper()
     divider = "―" * 22
-    english = "\n".join(f"{i}. {a['title']}" for i, a in enumerate(articles, 1))
-    try:
-        resp = claude.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=800,
-            messages=[{"role": "user", "content":
-                f"Translate these news headlines to Telugu. "
-                f"Reply with ONLY numbered Telugu translations. "
-                f"Keep company names and people names in English.\n\n{english}"
-            }],
-        )
-        raw    = resp.content[0].text.strip()
-        titles = [re.sub(r"^\d+[\.\)\:\-]\s*","", l).strip()
-                  for l in raw.split("\n") if l.strip()]
-        while len(titles) < len(articles):
-            titles.append(articles[len(titles)]["title"])
-        titles = titles[:len(articles)]
-    except Exception as ex:
-        logger.error(f"Translation {label}: {ex}")
-        titles = [a["title"] for a in articles]
-
-    lines    = "\n".join(f"{i}. {h(t)}" for i, t in enumerate(titles, 1))
-    text     = f"{divider}\n{cfg['emoji']} <b>{h(label)}</b>\n{divider}\n\n{lines}"
+    lines   = "\n".join(f"{i}. {h(a['title'])}" for i, a in enumerate(articles, 1))
+    text    = f"{divider}\n{cfg['emoji']} <b>{h(label)}</b>\n{divider}\n\n{lines}"
     ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}") for i in range(1, len(articles)+1)]
     link_row = [InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])         for i in range(1, len(articles)+1)]
     return text, InlineKeyboardMarkup([ask_row, link_row])
