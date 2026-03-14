@@ -268,7 +268,7 @@ async def fetch_x_trends(count: int = 5, country: str = "india") -> list:
         logger.warning("APIFY_API_TOKEN not set — skipping X trends")
         return []
     url = (
-        "https://api.apify.com/v2/acts/fastcrawler~x-twitter-trends-scraper-2025"
+        "https://api.apify.com/v2/acts/yasir-on-apify~twitter-x-trends-scraper-apify-actor"
         f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=60"
     )
     try:
@@ -314,7 +314,7 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         "lang:en filter:links"
     )
     url = (
-        "https://api.apify.com/v2/acts/apidojo~tweet-scraper"
+        "https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite"
         f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
     )
     payload = {
