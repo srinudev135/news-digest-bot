@@ -90,10 +90,25 @@ def load_settings() -> tuple[dict, dict]:
             data = json.loads(SETTINGS_FILE.read_text())
             loaded_topics   = data.get("topics",   DEFAULT_TOPICS.copy())
             loaded_settings = data.get("settings", DEFAULT_SETTINGS.copy())
-            # Ensure all default topics exist (in case new defaults were added)
+
+            # Ensure all DEFAULT_TOPICS exist in loaded_topics
             for k, v in DEFAULT_TOPICS.items():
                 if k not in loaded_topics:
                     loaded_topics[k] = v
+                    logger.info(f"➕ Added missing default topic: {k}")
+
+            # Ensure all DEFAULT_TOPICS are in active_topics if they were
+            # in the original DEFAULT_SETTINGS (i.e. new defaults added later)
+            for k in DEFAULT_SETTINGS["active_topics"]:
+                if k not in loaded_settings["active_topics"]:
+                    loaded_settings["active_topics"].append(k)
+                    logger.info(f"➕ Added missing active topic: {k}")
+
+            # Remove any active_topics that no longer exist in topics
+            loaded_settings["active_topics"] = [
+                k for k in loaded_settings["active_topics"] if k in loaded_topics
+            ]
+
             logger.info(f"✅ Settings loaded from {SETTINGS_FILE}")
             return loaded_topics, loaded_settings
         except Exception as ex:
