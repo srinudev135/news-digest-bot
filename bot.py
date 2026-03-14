@@ -330,6 +330,915 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
             logger.error(f"Apify tweet-scraper unexpected: {str(items)[:200]}")
             return []
 
+        # Log first item raw so we can see exact field names
+        if items:
+            logger.info(f"Apify raw sample item keys: {list(items[0].keys())}")
+            logger.info(f"Apify raw sample item: {json.dumps(items[0], ensure_ascii=False)[:600]}")
+
+        results = []
+        seen_links = set()
+
+        for item in items:
+            if len(results) >= count:
+                break
+
+            # ── Text: try every known field name ──
+            text = (
+                item.get("text") or
+                item.get("full_text") or
+                item.get("tweetText") or
+                item.get("tweet_text") or
+                item.get("content") or
+                item.get("body") or ""
+            ).replace("\n", " ").strip()
+
+            # ── Likes ──
+            likes = (
+                item.get("likeCount") or
+                item.get("favorite_count") or
+                item.get("likes") or
+                item.get("favourites_count") or
+                item.get("like_count") or 0
+            )
+
+            # ── Retweets ──
+            rts = (
+                item.get("retweetCount") or
+                item.get("retweet_count") or
+                item.get("retweets") or
+                item.get("rt_count") or 0
+            )
+
+            stats = f"❤️ {int(likes):,}  🔁 {int(rts):,}"
+
+            # ── Author ──
+            author_obj = item.get("author") or item.get("user") or {}
+            author = (
+                (author_obj.get("userName") or author_obj.get("screen_name") or
+                 author_obj.get("username") or author_obj.get("handle"))
+                if isinstance(author_obj, dict) else ""
+            ) or item.get("username") or item.get("screen_name") or item.get("authorName") or ""
+
+            # ── Tweet ID ──
+            tweet_id = (
+                item.get("id") or
+                item.get("tweetId") or
+                item.get("tweet_id") or
+                item.get("id_str") or
+                item.get("statusId") or ""
+            )
+
+            tweet_url = (
+                f"https://x.com/{author}/status/{tweet_id}"
+                if (author and tweet_id)
+                else item.get("url") or item.get("tweetUrl") or item.get("tweet_url") or "https://x.com/search?q=AI&f=top"
+            )
+
+            # ── Article URLs embedded in tweet ──
+            article_url = None
+            # Try multiple possible URL field locations
+            url_candidates = (
+                item.get("urls") or
+                item.get("extendedEntities", {}).get("urls") or
+                item.get("entities", {}).get("urls") or
+                []
+            )
+            if isinstance(url_candidates, list):
+                for u in url_candidates:
+                    if isinstance(u, dict):
+                        expanded = u.get("expanded_url") or u.get("expandedUrl") or u.get("url") or ""
+                    else:
+                        expanded = str(u)
+                    if expanded and not any(x in expanded for x in ["t.co", "twitter.com", "x.com"]):
+                        article_url = expanded
+                        break
+
+            link = article_url or tweet_url
+            title_text = (text[:110] + "...") if len(text) > 110 else text
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            prefix = "📰" if article_url else "🐦"
+            results.append({
+                "title":   f"{prefix} {title_text}  [{stats}]",
+                "link":    link,
+                "summary": text,
+                "author":  author,
+            })
+
+        logger.info(f"Fetched {len(results)} AI tweets/articles from X")
+        return results
+
+    except Exception as ex:
+        logger.error(f"Apify AI tweets error: {ex}")
+        return []
+
+
+async def build_x_trends_section(trends: list) -> tuple:
+    """Build the X Trends digest message + keyboard."""
+    divider = "―" * 22
+    lines   = "\n".join(f"{i}. {h(t['title'])}" for i, t in enumerate(trends, 1))
+    text    = f"{divider}\n🐦 <b>X TRENDS — INDIA</b>\n{divider}\n\n{lines}"
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|__xtrends__|{i-1}") for i in range(1, len(trends)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=trends[i-1]["link"])                for i in range(1, len(trends)+1)]
+    return text, InlineKeyboardMarkup([ask_row, link_row])
+
+
+async def build_x_ai_section(tweets: list) -> tuple:
+    """Build the Top AI Tweets digest message + keyboard."""
+    divider  = "―" * 22
+    lines    = "\n".join(f"{i}. {h(t['title'])}" for i, t in enumerate(tweets, 1))
+    text     = f"{divider}\n🤖🐦 <b>TRENDING AI ON X</b>\n<i>📰 = article link  🐦 = tweet link</i>\n{divider}\n\n{lines}"
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|__xai__|{i-1}") for i in range(1, len(tweets)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=tweets[i-1]["link"])             for i in range(1, len(tweets)+1)]
+    return text, InlineKeyboardMarkup([ask_row, link_row])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION BUILDER  (English titles, Telugu follow-up answers)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def build_telugu_section(key: str, articles: list) -> tuple:
+    cfg     = topics[key]
+    label   = cfg["label"].upper()
+    divider = "―" * 22
+    lines   = "\n".join(f"{i}. {h(a['title'])}" for i, a in enumerate(articles, 1))
+    text    = f"{divider}\n{cfg['emoji']} <b>{h(label)}</b>\n{divider}\n\n{lines}"
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|{key}|{i-1}") for i in range(1, len(articles)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=articles[i-1]["link"])         for i in range(1, len(articles)+1)]
+    return text, InlineKeyboardMarkup([ask_row, link_row])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DIGEST SENDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_digest(app: Application, chat_id: int):
+    global todays_digest
+    date_str = datetime.utcnow().strftime("%A, %d %B %Y")
+    await app.bot.send_message(chat_id=chat_id, parse_mode="HTML", text=(
+        f"🌅 <b>శుభోదయం!</b>\n📅 {h(date_str)}\n\n"
+        f"ఈరోజు మీ ముఖ్యమైన వార్తలు ఇక్కడ ఉన్నాయి.\n"
+        f"💬 వార్త గురించి అడగాలంటే నొక్కండి  |  🔗 పూర్తి వ్యాసం చదవాలంటే నొక్కండి"
+    ))
+    todays_digest = {}
+
+    # ── Regular topics (GeoPolitics, Finance, AI Updates, Crypto, user-added) ──
+    for key in settings["active_topics"]:
+        if key not in topics:
+            continue
+        cfg = topics[key]
+        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+        # Special: Trending AI on X — fetched via Apify, not RSS
+        if key == "__xai__":
+            if not APOFY_API_TOKEN:
+                continue
+            ai_tweets = await fetch_x_ai_tweets(count=settings["news_count"])
+            if not ai_tweets:
+                await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
+                    text=f"🤖🐦 <b>TRENDING AI ON X</b>\n\n<i>నేడు వార్తలు అందుబాటులో లేవు.</i>")
+                continue
+            todays_digest["__xai__"] = ai_tweets
+            text, kb = await build_x_ai_section(ai_tweets)
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=True)
+            continue
+
+        # Regular RSS/NewsAPI topic
+        articles = await fetch_section(key)
+        todays_digest[key] = articles
+        if not articles:
+            await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
+                text=f"{cfg['emoji']} <b>{h(cfg['label'].upper())}</b>\n\n<i>నేడు వార్తలు అందుబాటులో లేవు.</i>")
+            continue
+        text, kb = await build_telugu_section(key, articles)
+        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                   reply_markup=kb, disable_web_page_preview=True)
+
+    # ── X Trends — India overall trending (always last if Apify token set) ──
+    if APOFY_API_TOKEN:
+        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+        trends = await fetch_x_trends(count=settings["news_count"], country="india")
+        if trends:
+            todays_digest["__xtrends__"] = trends
+            text, kb = await build_x_trends_section(trends)
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=True)
+
+    await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
+        text="✅ <b>ఈరోజు వార్తలు పూర్తయ్యాయి!</b>\n\nఏదైనా ప్రశ్న అడగాలంటే నేరుగా టైప్ చేయండి.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def settings_text() -> str:
+    t          = settings["delivery_times"]
+    times_str  = "  &  ".join(t) if t else "Not set"
+    topics_str = "\n".join(
+        f"  {topics[k]['emoji']} {topics[k]['label']}"
+        for k in settings["active_topics"] if k in topics
+    ) or "  None"
+    # Always show X Trends India as a built-in footer note
+    x_note = "\n  🐦 X Trends — India (always included)" if APOFY_API_TOKEN else ""
+    return (
+        f"⚙️ <b>Settings</b>\n\n"
+        f"⏰ <b>Delivery Times (IST):</b> {h(times_str)}\n"
+        f"📋 <b>Active Topics:</b>\n{topics_str}{x_note}\n"
+        f"🔢 <b>News per Topic:</b> {settings['news_count']}\n"
+    )
+
+
+def settings_main_kb() -> InlineKeyboardMarkup:
+    t1         = settings["delivery_times"][0] if settings["delivery_times"] else "—"
+    t2         = settings["delivery_times"][1] if len(settings["delivery_times"]) > 1 else "—"
+    topics_str = ", ".join(topics[k]["label"] for k in settings["active_topics"] if k in topics) or "None"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⏰ Delivery Times: {t1}  {t2}", callback_data="set_times_menu")],
+        [InlineKeyboardButton(f"📋 Topics: {topics_str}",        callback_data="set_topics_menu")],
+        [InlineKeyboardButton(f"🔢 News per Topic: {settings['news_count']}", callback_data="set_count_menu")],
+        [InlineKeyboardButton("❌ Close",                         callback_data="set_close")],
+    ])
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb())
+
+
+def times_menu_kb() -> InlineKeyboardMarkup:
+    t  = settings["delivery_times"]
+    t1 = t[0] if len(t) > 0 else "Not set"
+    t2 = t[1] if len(t) > 1 else "Not set"
+    rows = [[InlineKeyboardButton(f"✏️ Edit Time 1: {t1}", callback_data="edit_time|0")]]
+    if len(t) < 2:
+        rows.append([InlineKeyboardButton("➕ Add 2nd delivery time", callback_data="add_time")])
+    else:
+        rows.append([InlineKeyboardButton(f"✏️ Edit Time 2: {t2}", callback_data="edit_time|1")])
+        rows.append([InlineKeyboardButton("🗑 Remove 2nd delivery time", callback_data="remove_time")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="set_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def topics_menu_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for key, cfg in topics.items():
+        active = key in settings["active_topics"]
+        icon   = "✅" if active else "⬜"
+        rows.append([InlineKeyboardButton(f"{icon} {cfg['emoji']} {cfg['label']}", callback_data=f"topic_toggle|{key}")])
+        if key not in DEFAULT_TOPICS:   # only allow deleting user-added topics
+            rows.append([InlineKeyboardButton(f"🗑 Remove {cfg['label']}", callback_data=f"topic_delete|{key}")])
+    rows.append([InlineKeyboardButton("➕ Add new topic...", callback_data="topic_add_new")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="set_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def count_menu_kb() -> InlineKeyboardMarkup:
+    counts = [3, 4, 5, 6, 7, 8, 10]
+    cur    = settings["news_count"]
+    row    = [InlineKeyboardButton(f"{'✅ ' if c == cur else ''}{c}", callback_data=f"set_count|{c}") for c in counts]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("« Back", callback_data="set_back")]])
+
+
+async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    data = q.data
+    await q.answer()
+
+    if data == "set_close":
+        await q.message.delete(); return
+
+    if data == "set_back":
+        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
+
+    # Times
+    if data == "set_times_menu":
+        await q.message.edit_text("⏰ <b>Delivery Times</b>\n\nIST, 24h format:", parse_mode="HTML", reply_markup=times_menu_kb()); return
+
+    if data == "add_time":
+        if len(settings["delivery_times"]) < 2:
+            settings["delivery_times"].append("18:00"); save_settings()
+        await q.message.edit_text("⏰ <b>Delivery Times</b>", parse_mode="HTML", reply_markup=times_menu_kb()); return
+
+    if data == "remove_time":
+        if len(settings["delivery_times"]) > 1:
+            settings["delivery_times"].pop(1); save_settings()
+        await q.message.edit_text("⏰ <b>Delivery Times</b>", parse_mode="HTML", reply_markup=times_menu_kb()); return
+
+    if data.startswith("edit_time|"):
+        idx = int(data.split("|")[1])
+        context.user_data["editing_time_idx"] = idx
+        cur = settings["delivery_times"][idx] if idx < len(settings["delivery_times"]) else "07:00"
+        await q.message.reply_text(
+            f"⏰ Time {idx+1} కి కొత్త సమయం టైప్ చేయండి (<b>HH:MM</b>, 24h IST)\n"
+            f"ఉదా: <code>06:00</code> లేదా <code>18:30</code>\n\nప్రస్తుతం: <b>{cur}</b>",
+            parse_mode="HTML"); return
+
+    # Topics
+    if data == "set_topics_menu":
+        await q.message.edit_text(
+            "📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive (tap to toggle)",
+            parse_mode="HTML", reply_markup=topics_menu_kb()); return
+
+    if data.startswith("topic_toggle|"):
+        key = data.split("|")[1]
+        if key in settings["active_topics"]:
+            if len(settings["active_topics"]) <= 1:
+                await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True); return
+            settings["active_topics"].remove(key)
+        else:
+            settings["active_topics"].append(key)
+        save_settings()
+        await q.message.edit_text("📋 <b>Topics</b>\n\n✅ = active  |  ⬜ = inactive",
+                                  parse_mode="HTML", reply_markup=topics_menu_kb()); return
+
+    if data.startswith("topic_delete|"):
+        key = data.split("|")[1]
+        if key in DEFAULT_TOPICS:
+            await q.answer("Default topic తొలగించలేరు.", show_alert=True); return
+        if len(settings["active_topics"]) <= 1 and key in settings["active_topics"]:
+            await q.answer("కనీసం ఒక topic ఉండాలి!", show_alert=True); return
+        topics.pop(key, None)
+        settings["active_topics"] = [k for k in settings["active_topics"] if k != key]
+        save_settings()
+        await q.message.edit_text("📋 <b>Topics</b>", parse_mode="HTML", reply_markup=topics_menu_kb()); return
+
+    if data == "topic_add_new":
+        context.user_data["adding_topic"] = True
+        await q.message.reply_text(
+            "📋 <b>కొత్త Topic జోడించండి</b>\n\n"
+            "మీకు కావలసిన topic పేరు టైప్ చేయండి.\n\n"
+            "ఉదాహరణలు:\n"
+            "• <code>Cricket news</code>\n"
+            "• <code>Indian stock market</code>\n"
+            "• <code>Bollywood</code>\n"
+            "• <code>Climate change</code>\n\n"
+            "AI అన్నీ automatically సెటప్ చేస్తుంది! 🤖",
+            parse_mode="HTML"); return
+
+    # Count
+    if data == "set_count_menu":
+        await q.message.edit_text(
+            f"🔢 <b>News per Topic</b>\n\nప్రస్తుతం: <b>{settings['news_count']}</b>",
+            parse_mode="HTML", reply_markup=count_menu_kb()); return
+
+    if data.startswith("set_count|"):
+        settings["news_count"] = int(data.split("|")[1])
+        save_settings()
+        await q.message.edit_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULE  — 7 AM IST = 01:30 UTC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ist_to_utc(ist_str: str) -> dtime:
+    hh, mm = map(int, ist_str.split(":"))
+    total  = (hh * 60 + mm - 330) % (24 * 60)   # IST = UTC + 5h30m
+    return dtime(hour=total // 60, minute=total % 60)
+
+
+def reschedule_jobs(app: Application):
+    for job in app.job_queue.get_jobs_by_name("daily_digest"):
+        job.schedule_removal()
+    for ist_time in settings["delivery_times"]:
+        try:
+            utc_t = ist_to_utc(ist_time)
+            app.job_queue.run_daily(scheduled_digest, time=utc_t, name="daily_digest")
+            logger.info(f"⏰ Scheduled digest: {ist_time} IST = {utc_t} UTC")
+        except Exception as ex:
+            logger.error(f"Schedule error {ist_time}: {ex}")
+
+
+async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("📰 Sending scheduled digest...")
+    await send_digest(context.application, TELEGRAM_CHAT_ID)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLAUDE CHAT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_system_prompt() -> str:
+    ctx = ""
+    for key, arts in todays_digest.items():
+        cfg = topics.get(key, {})
+        ctx += f"\n## {cfg.get('emoji','')} {cfg.get('label','')}\n"
+        for i, a in enumerate(arts, 1):
+            ctx += f"{i}. {a['title']}\n   {a['summary']}\n"
+    return (
+        "మీరు ఒక తెలివైన AI వార్తల విశ్లేషకుడు. "
+        "తెలుగులో 3-5 వాక్యాల విశ్లేషణ ఇవ్వండి. "
+        "సంస్థల పేర్లు, వ్యక్తుల పేర్లు ఆంగ్లంలోనే ఉంచండి.\n\n"
+        f"నేటి వార్తలు:\n{ctx}"
+    )
+
+
+async def ask_claude(chat_id: int, message: str) -> str:
+    conversation_history.setdefault(chat_id, [])
+    conversation_history[chat_id].append({"role": "user", "content": message})
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=400,
+            system=build_system_prompt(),
+            messages=conversation_history[chat_id][-20:],
+        )
+        reply = resp.content[0].text.strip()
+        conversation_history[chat_id].append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as ex:
+        logger.error(f"Claude: {ex}")
+        return "క్షమించండి, మళ్ళీ ప్రయత్నించండి."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id    = update.effective_chat.id
+    times      = "  &  ".join(settings["delivery_times"])
+    topic_list = ", ".join(topics[k]["label"] for k in settings["active_topics"] if k in topics)
+    await update.message.reply_text(
+        f"👋 <b>వార్తల Bot కి స్వాగతం!</b>\n\n"
+        f"Chat ID: <code>{chat_id}</code>\n\n"
+        f"⏰ Delivery: <b>{h(times)} IST</b>\n"
+        f"📋 Topics: <b>{h(topic_list)}</b>\n"
+        f"🔢 Stories each: <b>{settings['news_count']}</b>\n\n"
+        f"<b>Commands:</b>\n"
+        f"/digest — ఇప్పుడే వార్తలు చూడండి\n"
+        f"/settings — సెట్టింగ్స్ మార్చండి\n"
+        f"/clear — chat history క్లియర్ చేయండి",
+        parse_mode="HTML")
+
+
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ వార్తలు తీసుకొస్తున్నాను... సుమారు 30 సెకన్లు!")
+    await send_digest(context.application, update.effective_chat.id)
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conversation_history[update.effective_chat.id] = []
+    await update.message.reply_text("🧹 Chat history క్లియర్ అయింది!")
+
+
+async def send_reply_with_audio_btn(update: Update, chat_id: int, reply: str):
+    last_reply[chat_id] = reply
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔊 తెలుగులో వినండి", callback_data="tts")]])
+    await update.message.reply_text(reply, reply_markup=kb)
+
+
+async def handle_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    chat_id = update.effective_chat.id
+    await q.answer("🔊 ఆడియో తయారవుతోంది...")
+    text = last_reply.get(chat_id)
+    if not text:
+        await q.message.reply_text("మళ్ళీ ప్రశ్న అడగండి, తర్వాత 🔊 నొక్కండి."); return
+    await context.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+    try:
+        tts = gTTS(text=text, lang="te", slow=False)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tts.save(f.name); tmp = f.name
+        with open(tmp, "rb") as audio:
+            await context.bot.send_voice(chat_id=chat_id, voice=audio)
+        os.unlink(tmp)
+    except Exception as ex:
+        logger.error(f"TTS: {ex}")
+        await q.message.reply_text("ఆడియో తయారు చేయడంలో సమస్య వచ్చింది.")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id   = update.effective_chat.id
+    user_text = update.message.text.strip()
+    pending   = context.user_data.get("pending_story")
+    editing   = context.user_data.get("editing_time_idx")
+    adding    = context.user_data.get("adding_topic")
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    # Adding new topic
+    if adding:
+        context.user_data.pop("adding_topic")
+        await update.message.reply_text(
+            f"🤖 <b>\"{h(user_text)}\"</b> కోసం topic తయారు చేస్తున్నాను...\n10-15 సెకన్లు పట్టవచ్చు.",
+            parse_mode="HTML")
+        cfg = await generate_topic_config(user_text)
+        if not cfg:
+            await update.message.reply_text("❌ Topic తయారు చేయడంలో సమస్య. మళ్ళీ ప్రయత్నించండి."); return
+        key = cfg["key"]
+        if key in topics:
+            key = key + "_2"
+        topics[key] = {"emoji": cfg["emoji"], "label": cfg["label"],
+                       "newsapi_q": cfg["newsapi_q"], "rss": cfg.get("rss", [])}
+        settings["active_topics"].append(key)
+        save_settings()
+        await update.message.reply_text(
+            f"✅ <b>{cfg['emoji']} {h(cfg['label'])}</b> topic జోడించబడింది!\n"
+            f"తదుపరి digest నుండి వస్తాయి. ఇప్పుడే చూడాలంటే /digest పంపండి.",
+            parse_mode="HTML")
+        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
+
+    # Editing delivery time
+    if editing is not None:
+        context.user_data.pop("editing_time_idx")
+        m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", user_text)
+        if not m:
+            await update.message.reply_text(
+                "❌ Format తప్పు. <code>HH:MM</code> format లో ఇవ్వండి\nఉదా: <code>06:00</code>",
+                parse_mode="HTML"); return
+        while len(settings["delivery_times"]) <= editing:
+            settings["delivery_times"].append("07:00")
+        settings["delivery_times"][editing] = user_text
+        save_settings()
+        reschedule_jobs(context.application)
+        await update.message.reply_text(
+            f"✅ Delivery time {editing+1} → <b>{user_text} IST</b> గా మార్చబడింది!",
+            parse_mode="HTML")
+        await update.message.reply_text(settings_text(), parse_mode="HTML", reply_markup=settings_main_kb()); return
+
+    # Story follow-up
+    if pending:
+        section_key = pending["section_key"]
+        idx         = pending["idx"]
+        context.user_data.pop("pending_story")
+        article = todays_digest.get(section_key, [])[idx] if todays_digest else None
+        cfg     = topics.get(section_key, {})
+        if article:
+            prompt = (
+                f"User is asking about: {cfg.get('label','')} story #{idx+1}\n"
+                f"Title: {article['title']}\nSummary: {article['summary']}\n\n"
+                f"Question: {user_text}\n\nAnswer in Telugu, 3-5 sentences. Keep names in English."
+            )
+            reply = await ask_claude(chat_id, prompt)
+        else:
+            reply = await ask_claude(chat_id, user_text)
+        await send_reply_with_audio_btn(update, chat_id, reply); return
+
+    # Normal question
+    reply = await ask_claude(chat_id, user_text)
+    await send_reply_with_audio_btn(update, chat_id, reply)
+
+
+async def handle_story_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, section_key, idx_str = q.data.split("|")
+        idx     = int(idx_str)
+        article = todays_digest.get(section_key, [])[idx]
+    except (ValueError, IndexError):
+        await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి."); return
+    if section_key == "__xtrends__":
+        cfg = {"emoji": "🐦", "label": "X Trends"}
+    elif section_key == "__xai__":
+        cfg = {"emoji": "🤖🐦", "label": "Top AI Tweets on X"}
+    else:
+        cfg = topics.get(section_key, {})
+    context.user_data["pending_story"] = {"section_key": section_key, "idx": idx}
+    await q.message.reply_text(
+        f"📌 <b>{h(cfg.get('emoji',''))} {h(cfg.get('label',''))} #{idx+1}</b>\n"
+        f"<i>{h(article['title'])}</i>\n\n"
+        f"❓ ఈ వార్త గురించి మీ ప్రశ్న అడగండి — నేను తెలుగులో జవాబిస్తాను.",
+        parse_mode="HTML")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN — single workflow, sends digest at startup then stays alive for chat
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def post_init(app: Application):
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Webhook cleared.")
+    reschedule_jobs(app)
+    # Send digest immediately on startup (GitHub Action triggers at 7 AM IST)
+    logger.info("📰 Sending startup digest...")
+    await send_digest(app, TELEGRAM_CHAT_ID)
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_start))
+    app.add_handler(CommandHandler("digest",   cmd_digest))
+    app.add_handler(CommandHandler("clear",    cmd_clear))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CallbackQueryHandler(handle_tts,               pattern="^tts$"))
+    app.add_handler(CallbackQueryHandler(handle_story_callback,    pattern="^ask\\|"))
+    app.add_handler(CallbackQueryHandler(handle_settings_callback,
+                    pattern="^(set_|topic_|edit_time|add_time|remove_time|set_count)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("🤖 Bot running — polling for messages...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEFAULT TOPICS  (4 built-in)
+# ══════════════════════════════════════════════════════════════════════════════
+DEFAULT_TOPICS = {
+    "geopolitics": {
+        "emoji": "🌍", "label": "GeoPolitics",
+        "newsapi_q": "geopolitics international relations world affairs",
+        "rss": [
+            "https://feeds.reuters.com/reuters/worldNews",
+            "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+            "https://www.aljazeera.com/xml/rss/all.xml",
+        ],
+    },
+    "ai_updates": {
+        "emoji": "🤖", "label": "AI Updates",
+        "newsapi_q": "artificial intelligence machine learning OpenAI Google",
+        "rss": [
+            "https://techcrunch.com/category/artificial-intelligence/feed/",
+            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+            "https://feeds.feedburner.com/venturebeat/SZYF",
+        ],
+    },
+    "crypto": {
+        "emoji": "₿", "label": "Crypto",
+        "newsapi_q": "cryptocurrency bitcoin ethereum blockchain",
+        "rss": [
+            "https://cointelegraph.com/rss",
+            "https://coindesk.com/arc/outboundfeeds/rss/",
+            "https://decrypt.co/feed",
+        ],
+    },
+    # __xai__ is a special built-in key — fetched via Apify, not RSS/NewsAPI
+    "__xai__": {
+        "emoji": "🤖🐦", "label": "Trending AI on X",
+        "newsapi_q": "",   # unused — fetched via Apify
+        "rss":       [],   # unused — fetched via Apify
+        "builtin_x": True, # flag so settings UI shows it correctly
+    },
+}
+
+DEFAULT_SETTINGS = {
+    "delivery_times": ["07:00"],
+    "active_topics":  ["geopolitics", "ai_updates", "crypto", "__xai__"],
+    "news_count":     5,
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERSISTENT SETTINGS  — saved to settings.json, survives restarts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _gist_headers() -> dict:
+    """Headers for GitHub Gist API calls."""
+    token = GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def load_settings() -> tuple[dict, dict]:
+    """Load topics + settings from GitHub Gist, falling back to defaults."""
+    if not GIST_ID:
+        logger.warning("GIST_ID not set — using defaults.")
+        return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers=_gist_headers(),
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            gist = json.loads(r.read())
+        raw  = gist["files"][GIST_FILENAME]["content"]
+        data = json.loads(raw)
+
+        loaded_topics   = data.get("topics",   DEFAULT_TOPICS.copy())
+        loaded_settings = data.get("settings", DEFAULT_SETTINGS.copy())
+
+        # Merge in any new DEFAULT_TOPICS added in code updates
+        for k, v in DEFAULT_TOPICS.items():
+            if k not in loaded_topics:
+                loaded_topics[k] = v
+                logger.info(f"➕ Added missing default topic: {k}")
+
+        # Merge in any new default active_topics added in code updates
+        for k in DEFAULT_SETTINGS["active_topics"]:
+            if k not in loaded_settings["active_topics"]:
+                loaded_settings["active_topics"].append(k)
+                logger.info(f"➕ Added missing active topic: {k}")
+
+        # Remove orphaned active_topics
+        loaded_settings["active_topics"] = [
+            k for k in loaded_settings["active_topics"] if k in loaded_topics
+        ]
+
+        logger.info("✅ Settings loaded from Gist.")
+        return loaded_topics, loaded_settings
+    except Exception as ex:
+        logger.warning(f"Gist load failed ({ex}) — using defaults.")
+        return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
+
+
+def save_settings():
+    """Persist current topics + settings back to GitHub Gist."""
+    if not GIST_ID:
+        logger.warning("GIST_ID not set — settings not saved.")
+        return
+    try:
+        payload = json.dumps({
+            "files": {
+                GIST_FILENAME: {
+                    "content": json.dumps(
+                        {"topics": topics, "settings": settings},
+                        indent=2, ensure_ascii=False
+                    )
+                }
+            }
+        }).encode()
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/gists/{GIST_ID}",
+            data=payload,
+            headers={**_gist_headers(), "Content-Type": "application/json"},
+            method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=15)
+        logger.info("💾 Settings saved to Gist.")
+    except Exception as ex:
+        logger.error(f"Gist save failed: {ex}")
+
+
+# Load on startup
+topics, settings = load_settings()
+
+# ── In-memory state ───────────────────────────────────────────────────────────
+todays_digest:        dict            = {}
+conversation_history: dict[int, list] = {}
+last_reply:           dict[int, str]  = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLAUDE: AUTO-GENERATE TOPIC CONFIG FROM FREE TEXT
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def generate_topic_config(user_phrase: str) -> dict | None:
+    prompt = f"""The user wants to add a news topic: "{user_phrase}"
+
+Return a JSON object with ONLY these keys:
+- key: short snake_case id (e.g. "cricket")
+- label: clean display name (e.g. "Cricket")
+- emoji: one relevant emoji
+- newsapi_q: NewsAPI search query (5-8 words)
+- rss: array of 2-3 reliable public RSS feed URLs
+
+Reply with ONLY raw JSON, no markdown fences."""
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-4-20250514", max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = re.sub(r"^```[a-z]*\n?|\n?```$", "", resp.content[0].text.strip())
+        cfg = json.loads(raw)
+        for k in ("key", "label", "emoji", "newsapi_q", "rss"):
+            if k not in cfg:
+                raise ValueError(f"Missing: {k}")
+        return cfg
+    except Exception as ex:
+        logger.error(f"Topic generation failed: {ex}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FETCHING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_rss(urls: list, max_total: int) -> list:
+    articles = []
+    for url in urls:
+        if len(articles) >= max_total:
+            break
+        try:
+            for e in feedparser.parse(url).entries:
+                if len(articles) >= max_total:
+                    break
+                t, l = e.get("title","").strip(), e.get("link","").strip()
+                if t and l:
+                    articles.append({"title": t, "link": l,
+                                     "summary": e.get("summary","")[:400]})
+        except Exception as ex:
+            logger.warning(f"RSS {url}: {ex}")
+    return articles
+
+
+async def fetch_newsapi(query: str, max_items: int) -> list:
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://newsapi.org/v2/everything", params={
+                "q": query, "apiKey": NEWS_API_KEY,
+                "pageSize": max_items, "language": "en", "sortBy": "publishedAt",
+            })
+        return [
+            {"title": a["title"].strip(), "link": a["url"],
+             "summary": (a.get("description") or "")[:400]}
+            for a in r.json().get("articles", [])[:max_items]
+            if a.get("title") and "[Removed]" not in a.get("title","")
+        ]
+    except Exception as ex:
+        logger.warning(f"NewsAPI '{query}': {ex}")
+        return []
+
+
+async def fetch_section(key: str) -> list:
+    cfg   = topics[key]
+    count = settings["news_count"]
+    arts  = fetch_rss(cfg.get("rss", []), count)
+    if len(arts) < 3:
+        seen = {a["title"] for a in arts}
+        for a in await fetch_newsapi(cfg["newsapi_q"], count):
+            if a["title"] not in seen:
+                arts.append(a); seen.add(a["title"])
+    return arts[:count]
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  X TRENDS  — via Apify fastcrawler/x-twitter-trends-scraper-2025
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_x_trends(count: int = 5, country: str = "india") -> list:
+    """Fetch overall trending topics on X via Apify trends scraper."""
+    if not APOFY_API_TOKEN:
+        logger.warning("APIFY_API_TOKEN not set — skipping X trends")
+        return []
+    url = (
+        "https://api.apify.com/v2/acts/fastcrawler~x-twitter-trends-scraper-2025"
+        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=60"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(url, json={"country": country})
+        items = r.json()
+        if not isinstance(items, list):
+            logger.error(f"Apify trends unexpected response: {str(items)[:200]}")
+            return []
+        trends = []
+        for item in items[:count]:
+            name    = item.get("name") or item.get("trend") or item.get("title", "")
+            volume  = item.get("tweetVolume") or item.get("tweet_volume") or item.get("volume")
+            vol_str = f"{int(volume):,} tweets" if volume else "trending"
+            query   = name.lstrip("#").replace(" ", "%20")
+            link    = f"https://x.com/search?q={query}&src=trend_click"
+            trends.append({
+                "title":   f"{name}  ({vol_str})",
+                "link":    link,
+                "summary": f"{name} is trending on X with {vol_str}.",
+                "name":    name,
+            })
+        logger.info(f"Fetched {len(trends)} X trends for {country}")
+        return trends
+    except Exception as ex:
+        logger.error(f"Apify X trends error: {ex}")
+        return []
+
+
+async def fetch_x_ai_tweets(count: int = 5) -> list:
+    """
+    Fetch top AI-related tweets/articles trending on X via Apify apidojo/tweet-scraper.
+    Prioritises tweets that contain article links (URLs) — giving you articles shared on X.
+    Falls back to high-engagement tweet text if no article link found.
+    """
+    if not APOFY_API_TOKEN:
+        logger.warning("APIFY_API_TOKEN not set — skipping X AI tweets")
+        return []
+
+    # Search: AI topics, top engagement, English, last 7 days
+    search_query = (
+        "(artificial intelligence OR ChatGPT OR OpenAI OR Gemini OR Claude OR LLM) "
+        "lang:en min_faves:500 filter:links"   # filter:links = only tweets with article URLs
+    )
+    url = (
+        "https://api.apify.com/v2/acts/apidojo~tweet-scraper"
+        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
+    )
+    payload = {
+        "searchTerms": [search_query],
+        "searchMode":  "top",      # top by engagement
+        "maxItems":    count * 3,  # fetch extra, we'll filter for best ones
+    }
+    try:
+        async with httpx.AsyncClient(timeout=150) as c:
+            r = await c.post(url, json=payload)
+        items = r.json()
+        if not isinstance(items, list):
+            logger.error(f"Apify tweet-scraper unexpected: {str(items)[:200]}")
+            return []
+
         results = []
         seen_links = set()
 
