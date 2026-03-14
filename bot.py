@@ -64,11 +64,18 @@ DEFAULT_TOPICS = {
             "https://decrypt.co/feed",
         ],
     },
+    # __xai__ is a special built-in key — fetched via Apify, not RSS/NewsAPI
+    "__xai__": {
+        "emoji": "🤖🐦", "label": "Trending AI on X",
+        "newsapi_q": "",   # unused — fetched via Apify
+        "rss":       [],   # unused — fetched via Apify
+        "builtin_x": True, # flag so settings UI shows it correctly
+    },
 }
 
 DEFAULT_SETTINGS = {
     "delivery_times": ["07:00"],
-    "active_topics":  ["geopolitics", "finance", "ai_updates", "crypto"],
+    "active_topics":  ["geopolitics", "ai_updates", "crypto", "__xai__"],
     "news_count":     5,
 }
 
@@ -371,34 +378,42 @@ async def send_digest(app: Application, chat_id: int):
     for key in settings["active_topics"]:
         if key not in topics:
             continue
+        cfg = topics[key]
         await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+        # Special: Trending AI on X — fetched via Apify, not RSS
+        if key == "__xai__":
+            if not APOFY_API_TOKEN:
+                continue
+            ai_tweets = await fetch_x_ai_tweets(count=settings["news_count"])
+            if not ai_tweets:
+                await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
+                    text=f"🤖🐦 <b>TRENDING AI ON X</b>\n\n<i>నేడు వార్తలు అందుబాటులో లేవు.</i>")
+                continue
+            todays_digest["__xai__"] = ai_tweets
+            text, kb = await build_x_ai_section(ai_tweets)
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=True)
+            continue
+
+        # Regular RSS/NewsAPI topic
         articles = await fetch_section(key)
         todays_digest[key] = articles
         if not articles:
-            cfg = topics[key]
             await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
                 text=f"{cfg['emoji']} <b>{h(cfg['label'].upper())}</b>\n\n<i>నేడు వార్తలు అందుబాటులో లేవు.</i>")
             continue
         text, kb = await build_telugu_section(key, articles)
         await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                    reply_markup=kb, disable_web_page_preview=True)
-    # ── X Trends — India overall trending topics ──
+
+    # ── X Trends — India overall trending (always last if Apify token set) ──
     if APOFY_API_TOKEN:
         await app.bot.send_chat_action(chat_id=chat_id, action="typing")
         trends = await fetch_x_trends(count=settings["news_count"], country="india")
         if trends:
             todays_digest["__xtrends__"] = trends
             text, kb = await build_x_trends_section(trends)
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
-                                       reply_markup=kb, disable_web_page_preview=True)
-
-    # ── Trending AI Articles & Tweets on X ──
-    if APOFY_API_TOKEN:
-        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
-        ai_tweets = await fetch_x_ai_tweets(count=settings["news_count"])
-        if ai_tweets:
-            todays_digest["__xai__"] = ai_tweets
-            text, kb = await build_x_ai_section(ai_tweets)
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                        reply_markup=kb, disable_web_page_preview=True)
 
@@ -417,13 +432,12 @@ def settings_text() -> str:
         f"  {topics[k]['emoji']} {topics[k]['label']}"
         for k in settings["active_topics"] if k in topics
     ) or "  None"
-    x_sections = ""
-    if APOFY_API_TOKEN:
-        x_sections = "\n  🐦 X Trends — India (built-in)\n  🤖🐦 Trending AI on X (built-in)"
+    # Always show X Trends India as a built-in footer note
+    x_note = "\n  🐦 X Trends — India (always included)" if APOFY_API_TOKEN else ""
     return (
         f"⚙️ <b>Settings</b>\n\n"
         f"⏰ <b>Delivery Times (IST):</b> {h(times_str)}\n"
-        f"📋 <b>Active Topics:</b>\n{topics_str}{x_sections}\n"
+        f"📋 <b>Active Topics:</b>\n{topics_str}{x_note}\n"
         f"🔢 <b>News per Topic:</b> {settings['news_count']}\n"
     )
 
