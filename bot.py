@@ -26,6 +26,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
 NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+APOFY_API_TOKEN    = os.environ.get("APIFY_API_TOKEN", "")
 claude             = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def h(t): return html.escape(str(t))
@@ -43,15 +44,6 @@ DEFAULT_TOPICS = {
             "https://feeds.reuters.com/reuters/worldNews",
             "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
             "https://www.aljazeera.com/xml/rss/all.xml",
-        ],
-    },
-    "finance": {
-        "emoji": "💰", "label": "Finance",
-        "newsapi_q": "finance markets economy stocks",
-        "rss": [
-            "https://feeds.reuters.com/reuters/businessNews",
-            "https://www.cnbc.com/id/10000664/device/rss/rss.html",
-            "https://feeds.finance.yahoo.com/rss/2.0/headline",
         ],
     },
     "ai_updates": {
@@ -205,6 +197,147 @@ async def fetch_section(key: str) -> list:
     return arts[:count]
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  X TRENDS  — via Apify fastcrawler/x-twitter-trends-scraper-2025
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_x_trends(count: int = 5, country: str = "india") -> list:
+    """Fetch overall trending topics on X via Apify trends scraper."""
+    if not APOFY_API_TOKEN:
+        logger.warning("APIFY_API_TOKEN not set — skipping X trends")
+        return []
+    url = (
+        "https://api.apify.com/v2/acts/fastcrawler~x-twitter-trends-scraper-2025"
+        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=60"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(url, json={"country": country})
+        items = r.json()
+        if not isinstance(items, list):
+            logger.error(f"Apify trends unexpected response: {str(items)[:200]}")
+            return []
+        trends = []
+        for item in items[:count]:
+            name    = item.get("name") or item.get("trend") or item.get("title", "")
+            volume  = item.get("tweetVolume") or item.get("tweet_volume") or item.get("volume")
+            vol_str = f"{int(volume):,} tweets" if volume else "trending"
+            query   = name.lstrip("#").replace(" ", "%20")
+            link    = f"https://x.com/search?q={query}&src=trend_click"
+            trends.append({
+                "title":   f"{name}  ({vol_str})",
+                "link":    link,
+                "summary": f"{name} is trending on X with {vol_str}.",
+                "name":    name,
+            })
+        logger.info(f"Fetched {len(trends)} X trends for {country}")
+        return trends
+    except Exception as ex:
+        logger.error(f"Apify X trends error: {ex}")
+        return []
+
+
+async def fetch_x_ai_tweets(count: int = 5) -> list:
+    """
+    Fetch top AI-related tweets/articles trending on X via Apify apidojo/tweet-scraper.
+    Prioritises tweets that contain article links (URLs) — giving you articles shared on X.
+    Falls back to high-engagement tweet text if no article link found.
+    """
+    if not APOFY_API_TOKEN:
+        logger.warning("APIFY_API_TOKEN not set — skipping X AI tweets")
+        return []
+
+    # Search: AI topics, top engagement, English, last 7 days
+    search_query = (
+        "(artificial intelligence OR ChatGPT OR OpenAI OR Gemini OR Claude OR LLM) "
+        "lang:en min_faves:500 filter:links"   # filter:links = only tweets with article URLs
+    )
+    url = (
+        "https://api.apify.com/v2/acts/apidojo~tweet-scraper"
+        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
+    )
+    payload = {
+        "searchTerms": [search_query],
+        "searchMode":  "top",      # top by engagement
+        "maxItems":    count * 3,  # fetch extra, we'll filter for best ones
+    }
+    try:
+        async with httpx.AsyncClient(timeout=150) as c:
+            r = await c.post(url, json=payload)
+        items = r.json()
+        if not isinstance(items, list):
+            logger.error(f"Apify tweet-scraper unexpected: {str(items)[:200]}")
+            return []
+
+        results = []
+        seen_links = set()
+
+        for item in items:
+            if len(results) >= count:
+                break
+
+            text    = (item.get("text") or item.get("full_text") or "").replace("\n", " ").strip()
+            likes   = item.get("likeCount") or item.get("favorite_count") or 0
+            rts     = item.get("retweetCount") or item.get("retweet_count") or 0
+            stats   = f"❤️ {int(likes):,}  🔁 {int(rts):,}"
+            author  = (item.get("author") or {}).get("userName") or item.get("username") or ""
+            tweet_id = item.get("id") or item.get("tweetId") or item.get("id_str") or ""
+            tweet_url = f"https://x.com/{author}/status/{tweet_id}" if (author and tweet_id) else "https://x.com/search?q=AI&f=top"
+
+            # Try to find a shared article URL in the tweet
+            article_url = None
+            urls = item.get("urls") or item.get("entities", {}).get("urls", [])
+            for u in urls:
+                expanded = u.get("expanded_url") or u.get("url") or ""
+                # Skip t.co, x.com, twitter.com self-links
+                if expanded and "t.co" not in expanded and "twitter.com" not in expanded and "x.com" not in expanded:
+                    article_url = expanded
+                    break
+
+            link  = article_url or tweet_url   # prefer article, fall back to tweet
+            title_text = (text[:110] + "...") if len(text) > 110 else text
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+
+            prefix = "📰" if article_url else "🐦"
+            results.append({
+                "title":   f"{prefix} {title_text}  [{stats}]",
+                "link":    link,
+                "summary": text,
+                "author":  author,
+            })
+
+        logger.info(f"Fetched {len(results)} AI tweets/articles from X")
+        return results
+
+    except Exception as ex:
+        logger.error(f"Apify AI tweets error: {ex}")
+        return []
+
+
+async def build_x_trends_section(trends: list) -> tuple:
+    """Build the X Trends digest message + keyboard."""
+    divider = "―" * 22
+    lines   = "\n".join(f"{i}. {h(t['title'])}" for i, t in enumerate(trends, 1))
+    text    = f"{divider}\n🐦 <b>X TRENDS — INDIA</b>\n{divider}\n\n{lines}"
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|__xtrends__|{i-1}") for i in range(1, len(trends)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=trends[i-1]["link"])                for i in range(1, len(trends)+1)]
+    return text, InlineKeyboardMarkup([ask_row, link_row])
+
+
+async def build_x_ai_section(tweets: list) -> tuple:
+    """Build the Top AI Tweets digest message + keyboard."""
+    divider  = "―" * 22
+    lines    = "\n".join(f"{i}. {h(t['title'])}" for i, t in enumerate(tweets, 1))
+    text     = f"{divider}\n🤖🐦 <b>TRENDING AI ON X</b>\n<i>📰 = article link  🐦 = tweet link</i>\n{divider}\n\n{lines}"
+    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|__xai__|{i-1}") for i in range(1, len(tweets)+1)]
+    link_row = [InlineKeyboardButton(f"🔗 {i}", url=tweets[i-1]["link"])             for i in range(1, len(tweets)+1)]
+    return text, InlineKeyboardMarkup([ask_row, link_row])
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION BUILDER  (English titles, Telugu follow-up answers)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,6 +366,8 @@ async def send_digest(app: Application, chat_id: int):
         f"💬 వార్త గురించి అడగాలంటే నొక్కండి  |  🔗 పూర్తి వ్యాసం చదవాలంటే నొక్కండి"
     ))
     todays_digest = {}
+
+    # ── Regular topics (GeoPolitics, Finance, AI Updates, Crypto, user-added) ──
     for key in settings["active_topics"]:
         if key not in topics:
             continue
@@ -247,6 +382,26 @@ async def send_digest(app: Application, chat_id: int):
         text, kb = await build_telugu_section(key, articles)
         await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                    reply_markup=kb, disable_web_page_preview=True)
+    # ── X Trends — India overall trending topics ──
+    if APOFY_API_TOKEN:
+        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+        trends = await fetch_x_trends(count=settings["news_count"], country="india")
+        if trends:
+            todays_digest["__xtrends__"] = trends
+            text, kb = await build_x_trends_section(trends)
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=True)
+
+    # ── Trending AI Articles & Tweets on X ──
+    if APOFY_API_TOKEN:
+        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
+        ai_tweets = await fetch_x_ai_tweets(count=settings["news_count"])
+        if ai_tweets:
+            todays_digest["__xai__"] = ai_tweets
+            text, kb = await build_x_ai_section(ai_tweets)
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=True)
+
     await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
         text="✅ <b>ఈరోజు వార్తలు పూర్తయ్యాయి!</b>\n\nఏదైనా ప్రశ్న అడగాలంటే నేరుగా టైప్ చేయండి.")
 
@@ -262,10 +417,13 @@ def settings_text() -> str:
         f"  {topics[k]['emoji']} {topics[k]['label']}"
         for k in settings["active_topics"] if k in topics
     ) or "  None"
+    x_sections = ""
+    if APOFY_API_TOKEN:
+        x_sections = "\n  🐦 X Trends — India (built-in)\n  🤖🐦 Trending AI on X (built-in)"
     return (
         f"⚙️ <b>Settings</b>\n\n"
         f"⏰ <b>Delivery Times (IST):</b> {h(times_str)}\n"
-        f"📋 <b>Active Topics:</b>\n{topics_str}\n"
+        f"📋 <b>Active Topics:</b>\n{topics_str}{x_sections}\n"
         f"🔢 <b>News per Topic:</b> {settings['news_count']}\n"
     )
 
@@ -609,7 +767,12 @@ async def handle_story_callback(update: Update, context: ContextTypes.DEFAULT_TY
         article = todays_digest.get(section_key, [])[idx]
     except (ValueError, IndexError):
         await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి."); return
-    cfg = topics.get(section_key, {})
+    if section_key == "__xtrends__":
+        cfg = {"emoji": "🐦", "label": "X Trends"}
+    elif section_key == "__xai__":
+        cfg = {"emoji": "🤖🐦", "label": "Top AI Tweets on X"}
+    else:
+        cfg = topics.get(section_key, {})
     context.user_data["pending_story"] = {"section_key": section_key, "idx": idx}
     await q.message.reply_text(
         f"📌 <b>{h(cfg.get('emoji',''))} {h(cfg.get('label',''))} #{idx+1}</b>\n"
