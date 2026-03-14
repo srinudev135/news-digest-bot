@@ -27,11 +27,12 @@ TELEGRAM_CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
 NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 APOFY_API_TOKEN    = os.environ.get("APIFY_API_TOKEN", "")
+GIST_ID            = os.environ.get("GIST_ID", "")
+GIST_FILENAME      = "news_bot_settings.json"
+GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
 claude             = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def h(t): return html.escape(str(t))
-
-SETTINGS_FILE = Path("settings.json")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DEFAULT TOPICS  (4 built-in)
@@ -83,48 +84,85 @@ DEFAULT_SETTINGS = {
 #  PERSISTENT SETTINGS  — saved to settings.json, survives restarts
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _gist_headers() -> dict:
+    """Headers for GitHub Gist API calls."""
+    token = GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
 def load_settings() -> tuple[dict, dict]:
-    """Load topics + settings from file, falling back to defaults."""
-    if SETTINGS_FILE.exists():
-        try:
-            data = json.loads(SETTINGS_FILE.read_text())
-            loaded_topics   = data.get("topics",   DEFAULT_TOPICS.copy())
-            loaded_settings = data.get("settings", DEFAULT_SETTINGS.copy())
+    """Load topics + settings from GitHub Gist, falling back to defaults."""
+    if not GIST_ID:
+        logger.warning("GIST_ID not set — using defaults.")
+        return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers=_gist_headers(),
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            gist = json.loads(r.read())
+        raw  = gist["files"][GIST_FILENAME]["content"]
+        data = json.loads(raw)
 
-            # Ensure all DEFAULT_TOPICS exist in loaded_topics
-            for k, v in DEFAULT_TOPICS.items():
-                if k not in loaded_topics:
-                    loaded_topics[k] = v
-                    logger.info(f"➕ Added missing default topic: {k}")
+        loaded_topics   = data.get("topics",   DEFAULT_TOPICS.copy())
+        loaded_settings = data.get("settings", DEFAULT_SETTINGS.copy())
 
-            # Ensure all DEFAULT_TOPICS are in active_topics if they were
-            # in the original DEFAULT_SETTINGS (i.e. new defaults added later)
-            for k in DEFAULT_SETTINGS["active_topics"]:
-                if k not in loaded_settings["active_topics"]:
-                    loaded_settings["active_topics"].append(k)
-                    logger.info(f"➕ Added missing active topic: {k}")
+        # Merge in any new DEFAULT_TOPICS added in code updates
+        for k, v in DEFAULT_TOPICS.items():
+            if k not in loaded_topics:
+                loaded_topics[k] = v
+                logger.info(f"➕ Added missing default topic: {k}")
 
-            # Remove any active_topics that no longer exist in topics
-            loaded_settings["active_topics"] = [
-                k for k in loaded_settings["active_topics"] if k in loaded_topics
-            ]
+        # Merge in any new default active_topics added in code updates
+        for k in DEFAULT_SETTINGS["active_topics"]:
+            if k not in loaded_settings["active_topics"]:
+                loaded_settings["active_topics"].append(k)
+                logger.info(f"➕ Added missing active topic: {k}")
 
-            logger.info(f"✅ Settings loaded from {SETTINGS_FILE}")
-            return loaded_topics, loaded_settings
-        except Exception as ex:
-            logger.warning(f"Settings load failed ({ex}), using defaults.")
-    return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
+        # Remove orphaned active_topics
+        loaded_settings["active_topics"] = [
+            k for k in loaded_settings["active_topics"] if k in loaded_topics
+        ]
+
+        logger.info("✅ Settings loaded from Gist.")
+        return loaded_topics, loaded_settings
+    except Exception as ex:
+        logger.warning(f"Gist load failed ({ex}) — using defaults.")
+        return DEFAULT_TOPICS.copy(), DEFAULT_SETTINGS.copy()
 
 
 def save_settings():
-    """Persist current topics + settings to file."""
+    """Persist current topics + settings back to GitHub Gist."""
+    if not GIST_ID:
+        logger.warning("GIST_ID not set — settings not saved.")
+        return
     try:
-        SETTINGS_FILE.write_text(json.dumps(
-            {"topics": topics, "settings": settings}, indent=2, ensure_ascii=False
-        ))
-        logger.info("💾 Settings saved.")
+        payload = json.dumps({
+            "files": {
+                GIST_FILENAME: {
+                    "content": json.dumps(
+                        {"topics": topics, "settings": settings},
+                        indent=2, ensure_ascii=False
+                    )
+                }
+            }
+        }).encode()
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/gists/{GIST_ID}",
+            data=payload,
+            headers={**_gist_headers(), "Content-Type": "application/json"},
+            method="PATCH",
+        )
+        urllib.request.urlopen(req, timeout=15)
+        logger.info("💾 Settings saved to Gist.")
     except Exception as ex:
-        logger.error(f"Settings save failed: {ex}")
+        logger.error(f"Gist save failed: {ex}")
 
 
 # Load on startup
