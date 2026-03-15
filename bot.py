@@ -278,9 +278,12 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         {
             "actor": "kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result-cheapest",
             "payload": {
-                "searchTerms": ["artificial intelligence OR ChatGPT OR OpenAI OR Gemini OR LLM lang:en filter:links"],
-                "maxItems":    count,
-                "sort":        "Top",
+                "searchTerms": [
+                    "(ChatGPT OR OpenAI OR Gemini OR Claude OR LLM OR GPT) lang:en filter:links -is:retweet"
+                ],
+                "maxItems":     count * 5,  # fetch more, filter down to English with substance
+                "sort":         "Top",
+                "lang":         "en",       # actor-level language filter
             },
         },
     ]
@@ -330,21 +333,35 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
 
         # Skip empty tweets
         if not text:
-            logger.warning(f"Empty text in item: {json.dumps(item, ensure_ascii=False)[:200]}")
             continue
 
-        # Likes & retweets
-        likes = 0
-        for f in ("likeCount", "favorite_count", "likes", "like_count", "favouriteCount"):
-            likes = item.get(f) or 0
-            if likes:
-                break
+        # Skip non-English — simple heuristic: must contain mostly ASCII
+        non_ascii = sum(1 for c in text if ord(c) > 127)
+        if len(text) > 0 and non_ascii / len(text) > 0.3:
+            logger.info(f"Skipping non-English tweet: {text[:60]}")
+            continue
 
-        rts = 0
-        for f in ("retweetCount", "retweet_count", "retweets", "rt_count", "retweetsCount"):
-            rts = item.get(f) or 0
-            if rts:
-                break
+        # Skip very short or irrelevant content
+        if len(text) < 30:
+            continue
+
+        # Must contain at least one AI keyword to be relevant
+        ai_keywords = ["ai", "chatgpt", "openai", "gemini", "llm", "claude",
+                       "gpt", "machine learning", "artificial intelligence",
+                       "neural", "model", "deepmind", "mistral", "llama"]
+        text_lower = text.lower()
+        if not any(kw in text_lower for kw in ai_keywords):
+            logger.info(f"Skipping non-AI tweet: {text[:60]}")
+            continue
+
+        # Likes & retweets — try all known field names for this actor
+        likes = (item.get("likeCount") or item.get("favorite_count") or
+                 item.get("likes") or item.get("like_count") or
+                 item.get("favouriteCount") or item.get("favourites_count") or 0)
+
+        rts = (item.get("retweetCount") or item.get("retweet_count") or
+               item.get("retweets") or item.get("rt_count") or
+               item.get("retweetsCount") or 0)
 
         stats = f"❤️ {int(likes):,}  🔁 {int(rts):,}"
 
