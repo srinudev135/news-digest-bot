@@ -264,140 +264,106 @@ async def fetch_section(key: str) -> list:
 
 async def fetch_x_ai_tweets(count: int = 5) -> list:
     """
-    Fetch top AI tweets/articles on X via Apify, then use Claude to
-    filter to only genuinely relevant, English, high-quality AI content.
+    Fetch top AI tweets/articles on X via TwitterAPI.io
+    Endpoint: GET https://api.twitterapi.io/twitter/tweet/advanced_search
     """
-    if not APOFY_API_TOKEN:
-        logger.warning("APIFY_API_TOKEN not set — skipping X AI tweets")
+    twitter_api_key = os.environ.get("TWITTER_API_KEY", "")
+    if not twitter_api_key:
+        logger.warning("TWITTER_API_KEY not set — skipping X AI tweets")
         return []
 
-    url = (
-        "https://api.apify.com/v2/acts/kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result-cheapest"
-        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
+    query = (
+        "(ChatGPT OR OpenAI OR Gemini OR Claude OR LLM OR GPT-4 OR GPT-5 OR \"artificial intelligence\") "
+        "lang:en filter:links -is:retweet"
     )
-    payload = {
-        "searchTerms": [
-            "(ChatGPT OR OpenAI OR Gemini OR Claude OR LLM OR GPT-4 OR GPT-5) lang:en filter:links -is:retweet"
-        ],
-        "maxItems": count * 6,  # fetch extra so Claude can pick the best
-        "sort":     "Top",
-        "lang":     "en",
-    }
 
     try:
-        async with httpx.AsyncClient(timeout=150) as c:
-            r = await c.post(url, json=payload)
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(
+                "https://api.twitterapi.io/twitter/tweet/advanced_search",
+                headers={"X-API-Key": twitter_api_key},
+                params={
+                    "query":      query,
+                    "queryType":  "Top",
+                    "count":      count * 3,   # fetch extra, pick best
+                },
+            )
         data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            logger.warning(f"Apify returned no data: {str(data)[:200]}")
-            return []
-        logger.info(f"Apify returned {len(data)} raw items")
-        logger.info(f"Sample keys: {list(data[0].keys())}")
-        logger.info(f"Sample item: {json.dumps(data[0], ensure_ascii=False)[:600]}")
+        raw_tweets = data.get("tweets", [])
+        logger.info(f"TwitterAPI.io returned {len(raw_tweets)} tweets")
+        if raw_tweets:
+            logger.info(f"Sample keys: {list(raw_tweets[0].keys())}")
+
     except Exception as ex:
-        logger.error(f"Apify fetch failed: {ex}")
+        logger.error(f"TwitterAPI.io fetch failed: {ex}")
         return []
 
-    # ── Extract raw candidates ──
-    candidates = []
-    for item in data:
-        # Text — try all known field names
-        text = (
-            item.get("text") or item.get("full_text") or
-            item.get("tweetText") or item.get("tweet_text") or ""
-        ).replace("\n", " ").strip()
+    if not raw_tweets:
+        logger.warning("TwitterAPI.io returned empty tweets list")
+        return []
 
+    results    = []
+    seen_links = set()
+
+    for item in raw_tweets:
+        if len(results) >= count:
+            break
+
+        text = (item.get("text") or "").replace("\n", " ").strip()
         if not text or len(text) < 20:
             continue
 
-        # Engagement
-        likes = (item.get("likeCount") or item.get("favorite_count") or
-                 item.get("likes") or item.get("favouriteCount") or 0)
-        rts   = (item.get("retweetCount") or item.get("retweet_count") or
-                 item.get("retweets") or 0)
+        # Skip non-English
+        non_ascii = sum(1 for c in text if ord(c) > 127)
+        if len(text) > 0 and non_ascii / len(text) > 0.25:
+            continue
 
-        # Author
-        author_obj = item.get("author") or item.get("user") or {}
-        author = (
-            (author_obj.get("userName") or author_obj.get("username") or
-             author_obj.get("screen_name") or "") if isinstance(author_obj, dict)
-            else ""
-        ) or item.get("username") or item.get("screen_name") or ""
+        # Must mention AI topic
+        ai_kw = ["ai", "chatgpt", "openai", "gemini", "llm", "gpt", "claude",
+                 "artificial intelligence", "machine learning", "deepmind",
+                 "mistral", "llama", "neural", "model"]
+        if not any(k in text.lower() for k in ai_kw):
+            continue
 
-        # Tweet URL
-        tweet_id  = str(item.get("id") or item.get("tweetId") or item.get("id_str") or "")
-        tweet_url = (
-            item.get("url") or item.get("tweetUrl") or
-            (f"https://x.com/{author}/status/{tweet_id}" if author and tweet_id else "") or
-            "https://x.com/search?q=AI&f=top"
+        # Confirmed field names from TwitterAPI.io docs
+        likes   = item.get("likeCount")   or 0
+        rts     = item.get("retweetCount") or 0
+        views   = item.get("viewCount")    or 0
+        stats   = f"❤️ {int(likes):,}  🔁 {int(rts):,}  👁 {int(views):,}"
+
+        author_obj = item.get("author") or {}
+        author     = author_obj.get("userName") or author_obj.get("username") or ""
+
+        # Direct tweet URL from API
+        tweet_url = item.get("url") or (
+            f"https://x.com/{author}/status/{item.get('id','')}"
+            if author else "https://x.com/search?q=AI&f=top"
         )
 
-        # Article URL inside tweet
+        # Check for article URL in tweet entities
         article_url = None
-        for u in (item.get("urls") or
-                  (item.get("entities") or {}).get("urls") or []):
-            exp = (u.get("expanded_url") or u.get("expandedUrl") or u.get("url") or "") \
-                  if isinstance(u, dict) else str(u)
+        for u in (item.get("urls") or []):
+            exp = u.get("expanded_url") or u.get("url") or "" if isinstance(u, dict) else str(u)
             if exp and not any(x in exp for x in ["t.co", "twitter.com", "x.com"]):
                 article_url = exp
                 break
 
-        candidates.append({
-            "text":        text,
-            "likes":       int(likes),
-            "rts":         int(rts),
-            "tweet_url":   tweet_url,
-            "article_url": article_url,
-            "author":      author,
-        })
-
-    if not candidates:
-        logger.warning("No candidates extracted from Apify data")
-        return []
-
-    # ── Use Claude to pick the best `count` items ──
-    numbered = "\n".join(
-        f"{i+1}. {c['text'][:200]}"
-        for i, c in enumerate(candidates[:count * 4])
-    )
-    try:
-        resp = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=200,
-            messages=[{"role": "user", "content":
-                f"From these tweets, pick the {count} most genuinely insightful and "
-                f"relevant ones about AI technology, research, or products. "
-                f"Exclude astrology, unrelated topics, non-English, or low-quality content. "
-                f"Reply with ONLY the numbers separated by commas, e.g.: 1,3,5\n\n{numbered}"
-            }],
-        )
-        raw_picks = resp.content[0].text.strip()
-        picks = [int(x.strip()) - 1 for x in raw_picks.split(",") if x.strip().isdigit()]
-        picks = [p for p in picks if 0 <= p < len(candidates)][:count]
-        logger.info(f"Claude picked indices: {picks}")
-    except Exception as ex:
-        logger.warning(f"Claude filtering failed ({ex}) — using top {count} by index")
-        picks = list(range(min(count, len(candidates))))
-
-    results = []
-    seen    = set()
-    for idx in picks:
-        c    = candidates[idx]
-        link = c["article_url"] or c["tweet_url"]
-        if link in seen:
+        link = article_url or tweet_url
+        if link in seen_links:
             continue
-        seen.add(link)
-        stats      = f"❤️ {c['likes']:,}  🔁 {c['rts']:,}"
-        prefix     = "📰" if c["article_url"] else "🐦"
-        title_text = (c["text"][:110] + "...") if len(c["text"]) > 110 else c["text"]
+        seen_links.add(link)
+
+        prefix     = "📰" if article_url else "🐦"
+        title_text = (text[:110] + "...") if len(text) > 110 else text
+
         results.append({
             "title":   f"{prefix} {title_text}  [{stats}]",
             "link":    link,
-            "summary": c["text"],
-            "author":  c["author"],
+            "summary": text,
+            "author":  author,
         })
 
-    logger.info(f"Returning {len(results)} filtered AI tweets")
+    logger.info(f"Returning {len(results)} AI tweets")
     return results
 
 
