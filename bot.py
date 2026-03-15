@@ -29,7 +29,7 @@ ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 APOFY_API_TOKEN    = os.environ.get("APIFY_API_TOKEN", "")
 GIST_ID            = os.environ.get("GIST_ID", "")
 GIST_FILENAME      = "news_bot_settings.json"
-GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN       = os.environ.get("PAT_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
 claude             = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def h(t): return html.escape(str(t))
@@ -85,8 +85,12 @@ DEFAULT_SETTINGS = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _gist_headers() -> dict:
-    """Headers for GitHub Gist API calls."""
-    token = GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN", "")
+    """Headers for GitHub Gist API calls — uses PAT_TOKEN for Gist access."""
+    token = os.environ.get("PAT_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        logger.warning("No GitHub token found for Gist access!")
+    else:
+        logger.info(f"Gist token type: {'PAT' if os.environ.get('PAT_TOKEN') else 'GITHUB_TOKEN'}")
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -258,148 +262,157 @@ async def fetch_section(key: str) -> list:
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  X TRENDS  — via Apify fastcrawler/x-twitter-trends-scraper-2025
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def fetch_x_trends(count: int = 5, country: str = "India") -> list:
-    """Fetch overall trending topics on X via Apify trends scraper."""
-    if not APOFY_API_TOKEN:
-        logger.warning("APIFY_API_TOKEN not set — skipping X trends")
-        return []
-    url = (
-        "https://api.apify.com/v2/acts/yasir-on-apify~twitter-x-trends-scraper-apify-actor"
-        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=60"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=90) as c:
-            r = await c.post(url, json={"country": country})
-        items = r.json()
-        if not isinstance(items, list):
-            logger.error(f"Apify trends unexpected response: {str(items)[:200]}")
-            return []
-        trends = []
-        for item in items[:count]:
-            name    = item.get("name") or item.get("trend") or item.get("title", "")
-            volume  = item.get("tweetVolume") or item.get("tweet_volume") or item.get("volume")
-            vol_str = f"{int(volume):,} tweets" if volume else "trending"
-            query   = name.lstrip("#").replace(" ", "%20")
-            link    = f"https://x.com/search?q={query}&src=trend_click"
-            trends.append({
-                "title":   f"{name}  ({vol_str})",
-                "link":    link,
-                "summary": f"{name} is trending on X with {vol_str}.",
-                "name":    name,
-            })
-        logger.info(f"Fetched {len(trends)} X trends for {country}")
-        return trends
-    except Exception as ex:
-        logger.error(f"Apify X trends error: {ex}")
-        return []
-
-
 async def fetch_x_ai_tweets(count: int = 5) -> list:
     """
-    Fetch top AI-related tweets/articles trending on X via Apify apidojo/tweet-scraper.
-    Prioritises tweets that contain article links (URLs) — giving you articles shared on X.
-    Falls back to high-engagement tweet text if no article link found.
+    Fetch top AI tweets/articles on X via Apify.
+    Uses apidojo/twitter-scraper with searchQueries input.
     """
     if not APOFY_API_TOKEN:
         logger.warning("APIFY_API_TOKEN not set — skipping X AI tweets")
         return []
 
-    # Search: AI topics, top engagement, English
-    search_query = (
-        "(artificial intelligence OR ChatGPT OR OpenAI OR Gemini OR Claude OR LLM) "
-        "lang:en filter:links"
-    )
-    url = (
-        "https://api.apify.com/v2/acts/apidojo~twitter-scraper-lite"
-        f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
-    )
-    payload = {
-        "searchTerms":  [search_query],
-        "sort":         "Top",         # confirmed field name from docs
-        "maxItems":     count * 3,
-        "tweetLanguage": "en",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=150) as c:
-            r = await c.post(url, json=payload)
-        items = r.json()
-        if not isinstance(items, list):
-            logger.error(f"Apify tweet-scraper unexpected: {str(items)[:200]}")
-            return []
+    # Two separate actors tried in order — first that returns data wins
+    attempts = [
+        {
+            "actor": "apidojo~tweet-scraper",
+            "payload": {
+                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM"],
+                "maxTweets":   count * 3,
+                "queryType":   "Top",
+            },
+        },
+        {
+            "actor": "apidojo~twitter-scraper-lite",
+            "payload": {
+                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM"],
+                "maxItems":    count * 3,
+                "sort":        "Top",
+            },
+        },
+        {
+            "actor": "quacker~twitter-search-scraper",
+            "payload": {
+                "searchTerms": ["artificial intelligence ChatGPT OpenAI"],
+                "maxItems":    count * 3,
+            },
+        },
+    ]
 
-        # Log first item raw so we can see exact field names
-        if items:
-            logger.info(f"Apify raw sample item keys: {list(items[0].keys())}")
-            logger.info(f"Apify raw sample item: {json.dumps(items[0], ensure_ascii=False)[:600]}")
-
-        results = []
-        seen_links = set()
-
-        for item in items:
-            if len(results) >= count:
+    items = []
+    for attempt in attempts:
+        actor   = attempt["actor"]
+        payload = attempt["payload"]
+        url = (
+            f"https://api.apify.com/v2/acts/{actor}"
+            f"/run-sync-get-dataset-items?token={APOFY_API_TOKEN}&timeout=120"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=150) as c:
+                r = await c.post(url, json=payload)
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                logger.info(f"✅ Actor {actor} returned {len(data)} items")
+                logger.info(f"Sample keys: {list(data[0].keys())}")
+                logger.info(f"Sample item: {json.dumps(data[0], ensure_ascii=False)[:500]}")
+                items = data
                 break
+            else:
+                logger.warning(f"Actor {actor} returned no data: {str(data)[:200]}")
+        except Exception as ex:
+            logger.warning(f"Actor {actor} failed: {ex}")
+            continue
 
-            # Confirmed field names from apidojo/tweet-scraper docs:
-            # id, text, author{userName}, likeCount, retweetCount, url
-            text     = (item.get("text") or "").replace("\n", " ").strip()
-            likes    = item.get("likeCount") or 0
-            rts      = item.get("retweetCount") or 0
-            stats    = f"❤️ {int(likes):,}  🔁 {int(rts):,}"
-
-            # author is an object with userName field
-            author_obj = item.get("author") or {}
-            author     = author_obj.get("userName") or author_obj.get("username") or ""
-
-            # direct tweet URL field
-            tweet_url = (
-                item.get("url") or
-                (f"https://x.com/{author}/status/{item.get('id','')}" if author else "") or
-                "https://x.com/search?q=AI&f=top"
-            )
-
-            # Article URLs embedded in tweet entities
-            article_url = None
-            for u in (item.get("urls") or []):
-                expanded = u.get("expanded_url") or u.get("url") or "" if isinstance(u, dict) else str(u)
-                if expanded and not any(x in expanded for x in ["t.co", "twitter.com", "x.com"]):
-                    article_url = expanded
-                    break
-
-            link       = article_url or tweet_url
-            title_text = (text[:110] + "...") if len(text) > 110 else text
-
-            if link in seen_links:
-                continue
-            seen_links.add(link)
-
-            prefix = "📰" if article_url else "🐦"
-            results.append({
-                "title":   f"{prefix} {title_text}  [{stats}]",
-                "link":    link,
-                "summary": text,
-                "author":  author,
-            })
-
-        logger.info(f"Fetched {len(results)} AI tweets/articles from X")
-        return results
-
-    except Exception as ex:
-        logger.error(f"Apify AI tweets error: {ex}")
+    if not items:
+        logger.error("All Apify actors failed — no AI tweets fetched")
         return []
 
+    results    = []
+    seen_links = set()
 
-async def build_x_trends_section(trends: list) -> tuple:
-    """Build the X Trends digest message + keyboard."""
-    divider = "―" * 22
-    lines   = "\n".join(f"{i}. {h(t['title'])}" for i, t in enumerate(trends, 1))
-    text    = f"{divider}\n🐦 <b>X TRENDS — INDIA</b>\n{divider}\n\n{lines}"
-    ask_row  = [InlineKeyboardButton(f"💬 {i}", callback_data=f"ask|__xtrends__|{i-1}") for i in range(1, len(trends)+1)]
-    link_row = [InlineKeyboardButton(f"🔗 {i}", url=trends[i-1]["link"])                for i in range(1, len(trends)+1)]
-    return text, InlineKeyboardMarkup([ask_row, link_row])
+    for item in items:
+        if len(results) >= count:
+            break
+
+        # Extract text — try every possible field
+        text = ""
+        for f in ("text", "full_text", "tweetText", "tweet_text", "content", "body", "description"):
+            text = (item.get(f) or "").strip()
+            if text:
+                break
+        text = text.replace("\n", " ").strip()
+
+        # Skip empty tweets
+        if not text:
+            logger.warning(f"Empty text in item: {json.dumps(item, ensure_ascii=False)[:200]}")
+            continue
+
+        # Likes & retweets
+        likes = 0
+        for f in ("likeCount", "favorite_count", "likes", "like_count", "favouriteCount"):
+            likes = item.get(f) or 0
+            if likes:
+                break
+
+        rts = 0
+        for f in ("retweetCount", "retweet_count", "retweets", "rt_count", "retweetsCount"):
+            rts = item.get(f) or 0
+            if rts:
+                break
+
+        stats = f"❤️ {int(likes):,}  🔁 {int(rts):,}"
+
+        # Author
+        author = ""
+        author_obj = item.get("author") or item.get("user") or {}
+        if isinstance(author_obj, dict):
+            for f in ("userName", "screen_name", "username", "handle", "login"):
+                author = author_obj.get(f) or ""
+                if author:
+                    break
+        if not author:
+            for f in ("username", "screen_name", "authorName", "handle"):
+                author = item.get(f) or ""
+                if author:
+                    break
+
+        # Tweet URL
+        tweet_id  = item.get("id") or item.get("tweetId") or item.get("id_str") or ""
+        tweet_url = (
+            item.get("url") or item.get("tweetUrl") or item.get("tweet_url") or
+            (f"https://x.com/{author}/status/{tweet_id}" if (author and tweet_id) else "") or
+            "https://x.com/search?q=AI&f=top"
+        )
+
+        # Article URL embedded in tweet
+        article_url = None
+        url_list = (
+            item.get("urls") or
+            (item.get("entities") or {}).get("urls") or
+            (item.get("extendedEntities") or {}).get("urls") or []
+        )
+        for u in url_list:
+            exp = (u.get("expanded_url") or u.get("expandedUrl") or u.get("url") or "") if isinstance(u, dict) else str(u)
+            if exp and not any(x in exp for x in ["t.co", "twitter.com", "x.com"]):
+                article_url = exp
+                break
+
+        link       = article_url or tweet_url
+        title_text = (text[:110] + "...") if len(text) > 110 else text
+
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        prefix = "📰" if article_url else "🐦"
+        results.append({
+            "title":   f"{prefix} {title_text}  [{stats}]",
+            "link":    link,
+            "summary": text,
+            "author":  author,
+        })
+
+    logger.info(f"Returning {len(results)} AI tweets")
+    return results
 
 
 async def build_x_ai_section(tweets: list) -> tuple:
@@ -474,16 +487,6 @@ async def send_digest(app: Application, chat_id: int):
         await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
                                    reply_markup=kb, disable_web_page_preview=True)
 
-    # ── X Trends — India overall trending (always last if Apify token set) ──
-    if APOFY_API_TOKEN:
-        await app.bot.send_chat_action(chat_id=chat_id, action="typing")
-        trends = await fetch_x_trends(count=settings["news_count"], country="India")
-        if trends:
-            todays_digest["__xtrends__"] = trends
-            text, kb = await build_x_trends_section(trends)
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML",
-                                       reply_markup=kb, disable_web_page_preview=True)
-
     await app.bot.send_message(chat_id=chat_id, parse_mode="HTML",
         text="✅ <b>ఈరోజు వార్తలు పూర్తయ్యాయి!</b>\n\nఏదైనా ప్రశ్న అడగాలంటే నేరుగా టైప్ చేయండి.")
 
@@ -499,8 +502,7 @@ def settings_text() -> str:
         f"  {topics[k]['emoji']} {topics[k]['label']}"
         for k in settings["active_topics"] if k in topics
     ) or "  None"
-    # Always show X Trends India as a built-in footer note
-    x_note = "\n  🐦 X Trends — India (always included)" if APOFY_API_TOKEN else ""
+    x_note = ""
     return (
         f"⚙️ <b>Settings</b>\n\n"
         f"⏰ <b>Delivery Times (IST):</b> {h(times_str)}\n"
@@ -848,9 +850,7 @@ async def handle_story_callback(update: Update, context: ContextTypes.DEFAULT_TY
         article = todays_digest.get(section_key, [])[idx]
     except (ValueError, IndexError):
         await q.message.reply_text("వార్త కనుగొనలేదు. /digest తో మళ్ళీ ప్రయత్నించండి."); return
-    if section_key == "__xtrends__":
-        cfg = {"emoji": "🐦", "label": "X Trends"}
-    elif section_key == "__xai__":
+    if section_key == "__xai__":
         cfg = {"emoji": "🤖🐦", "label": "Top AI Tweets on X"}
     else:
         cfg = topics.get(section_key, {})
