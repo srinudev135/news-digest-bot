@@ -272,21 +272,14 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         return []
 
     # Two separate actors tried in order — first that returns data wins
-    # actor requires minimum 50 items — fetch 50, display top `count`
+    # Pay-per-result actor — no rental needed, $0.25/1000 tweets
+    # Fetching 5 tweets/day costs ~$0.03/month from Apify credits
     attempts = [
         {
-            "actor": "apidojo~twitter-scraper-lite",
+            "actor": "kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result-cheapest",
             "payload": {
-                "searchTerms": ["artificial intelligence ChatGPT OpenAI Gemini LLM lang:en filter:links"],
-                "maxItems":    50,
-                "sort":        "Top",
-            },
-        },
-        {
-            "actor": "apidojo~tweet-scraper",
-            "payload": {
-                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM lang:en filter:links"],
-                "maxItems":    50,
+                "searchTerms": ["artificial intelligence OR ChatGPT OR OpenAI OR Gemini OR LLM lang:en filter:links"],
+                "maxItems":    count,
                 "sort":        "Top",
             },
         },
