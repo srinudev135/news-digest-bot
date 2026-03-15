@@ -272,28 +272,22 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         return []
 
     # Two separate actors tried in order — first that returns data wins
+    # actor requires minimum 50 items — fetch 50, display top `count`
     attempts = [
-        {
-            "actor": "apidojo~tweet-scraper",
-            "payload": {
-                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM"],
-                "maxTweets":   count * 3,
-                "queryType":   "Top",
-            },
-        },
         {
             "actor": "apidojo~twitter-scraper-lite",
             "payload": {
-                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM"],
-                "maxItems":    count * 3,
+                "searchTerms": ["artificial intelligence ChatGPT OpenAI Gemini LLM lang:en filter:links"],
+                "maxItems":    50,
                 "sort":        "Top",
             },
         },
         {
-            "actor": "quacker~twitter-search-scraper",
+            "actor": "apidojo~tweet-scraper",
             "payload": {
-                "searchTerms": ["artificial intelligence ChatGPT OpenAI"],
-                "maxItems":    count * 3,
+                "searchTerms": ["artificial intelligence ChatGPT OpenAI LLM lang:en filter:links"],
+                "maxItems":    50,
+                "sort":        "Top",
             },
         },
     ]
