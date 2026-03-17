@@ -320,6 +320,21 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         if len(text) > 0 and non_ascii / len(text) > 0.25:
             continue
 
+        # Reject scam/spam content
+        scam_kw = [
+            "giveaway", "airdrop", "presale", "100x", "guaranteed", "free crypto",
+            "pump", "shill", "get rich", "moon soon", "buy now", "last chance",
+            "whitelist", "mint now", "paying my followers", "pay my followers",
+            "join my tg", "join my telegram", "join my discord", "join my channel",
+            "join our tg", "join our discord", "join our channel", "join our group",
+            "link in bio", "turned $", "i turned", "flipped my", "made $",
+            "passive income", "financial freedom", "quit your job",
+            "early access", "alpha call", "follow me", "dm me", "dm for",
+        ]
+        if any(s in text.lower() for s in scam_kw):
+            logger.info(f"Skipping scam AI tweet: {text[:60]}")
+            continue
+
         # Must mention AI topic
         ai_kw = ["ai", "chatgpt", "openai", "gemini", "llm", "gpt", "claude",
                  "artificial intelligence", "machine learning", "deepmind",
@@ -394,9 +409,10 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         logger.warning("TWITTER_API_KEY not set — skipping X Crypto tweets")
         return []
 
+    # Strict query: reputable crypto news only, scam terms excluded at API level
     query = (
-        "(Bitcoin OR Ethereum OR crypto OR blockchain OR BTC OR ETH OR altcoin OR DeFi OR NFT) "
-        "lang:en filter:links -is:retweet"
+        '(Bitcoin OR Ethereum OR "crypto market" OR blockchain OR DeFi OR "crypto regulation") '
+        'lang:en filter:links -is:retweet -giveaway -airdrop -presale -pump -shill'
     )
 
     try:
@@ -407,7 +423,7 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
                 params={
                     "query":     query,
                     "queryType": "Top",
-                    "count":     count * 3,
+                    "count":     count * 4,  # fetch more since we filter aggressively
                 },
             )
         data       = r.json()
@@ -422,16 +438,40 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
 
     results    = []
     seen_links = set()
-    crypto_kw  = ["bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain",
-                  "defi", "nft", "altcoin", "web3", "coinbase", "binance",
-                  "solana", "xrp", "doge", "token", "wallet", "exchange"]
+
+    # Legitimate crypto keywords
+    crypto_kw = ["bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain",
+                 "defi", "regulation", "sec", "coinbase", "binance", "solana",
+                 "market", "price", "etf", "halving", "layer", "protocol"]
+
+    # Scam/spam patterns to reject
+    scam_kw = [
+        # Financial scams
+        "giveaway", "airdrop", "presale", "100x", "guaranteed", "free crypto",
+        "pump", "shill", "get rich", "moon soon", "buy now", "last chance",
+        "limited offer", "whitelist", "mint now", "rug pull", "dont miss",
+        "don't miss", "going to moon", "next 100x", "gem alert", "hidden gem",
+        # Follower/referral scams
+        "paying my followers", "pay my followers", "paying followers",
+        "follow me", "follow back", "dm me", "dm for",
+        # Community recruitment spam
+        "join my tg", "join my telegram", "join my discord", "join my channel",
+        "join my group", "join our tg", "join our telegram", "join our discord",
+        "join our channel", "join our group", "join the group", "join the channel",
+        "link in bio", "check my bio", "link in my bio",
+        # Suspicious phrases
+        "turned $", "turned my $", "i turned", "flipped my",
+        "made $", "made me $", "made him $", "made her $",
+        "passive income", "financial freedom", "quit your job",
+        "early access", "exclusive access", "alpha call",
+    ]
 
     for item in raw_tweets:
         if len(results) >= count:
             break
 
         text = (item.get("text") or "").replace("\n", " ").strip()
-        if not text or len(text) < 20:
+        if not text or len(text) < 30:
             continue
 
         # Skip non-English
@@ -439,8 +479,20 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         if len(text) > 0 and non_ascii / len(text) > 0.25:
             continue
 
-        # Must mention crypto keyword
-        if not any(k in text.lower() for k in crypto_kw):
+        text_lower = text.lower()
+
+        # Reject scam/spam content
+        if any(s in text_lower for s in scam_kw):
+            logger.info(f"Skipping scam crypto tweet: {text[:60]}")
+            continue
+
+        # Must mention legitimate crypto keyword
+        if not any(k in text_lower for k in crypto_kw):
+            continue
+
+        # Require minimum engagement — filters out bot/spam accounts
+        likes = item.get("likeCount") or 0
+        if int(likes) < 5:
             continue
 
         likes  = item.get("likeCount")   or 0
