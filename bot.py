@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = int(os.environ["TELEGRAM_CHAT_ID"])
+# All recipients — add TELEGRAM_CHAT_ID_2, _3 etc in GitHub Secrets to add more
+CHAT_IDS = [TELEGRAM_CHAT_ID] + [
+    int(os.environ[f"TELEGRAM_CHAT_ID_{i}"])
+    for i in range(2, 6)
+    if os.environ.get(f"TELEGRAM_CHAT_ID_{i}")
+]
 NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 GIST_ID            = os.environ.get("GIST_ID", "")
@@ -178,6 +184,7 @@ topics, settings = load_settings()
 todays_digest:        dict            = {}
 conversation_history: dict[int, list] = {}
 last_reply:           dict[int, str]  = {}
+x_seen_links:         set             = set()   # shared across all X sections per digest run
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,8 +273,8 @@ async def fetch_section(key: str) -> list:
 
 async def fetch_x_ai_tweets(count: int = 5) -> list:
     """
-    Fetch top AI tweets/articles on X via TwitterAPI.io
-    Endpoint: GET https://api.twitterapi.io/twitter/tweet/advanced_search
+    Fetch top AI tweets/articles on X via TwitterAPI.io.
+    Uses shared x_seen_links to deduplicate across all X sections.
     """
     twitter_api_key = os.environ.get("TWITTER_API_KEY", "")
     if not twitter_api_key:
@@ -304,8 +311,7 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
         logger.warning("TwitterAPI.io returned empty tweets list")
         return []
 
-    results    = []
-    seen_links = set()
+    results = []
 
     for item in raw_tweets:
         if len(results) >= count:
@@ -330,6 +336,7 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
             "link in bio", "turned $", "i turned", "flipped my", "made $",
             "passive income", "financial freedom", "quit your job",
             "early access", "alpha call", "follow me", "dm me", "dm for",
+            "bring me $", "money print", "print script", "money script",
         ]
         if any(s in text.lower() for s in scam_kw):
             logger.info(f"Skipping scam AI tweet: {text[:60]}")
@@ -366,9 +373,9 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
                 break
 
         link = article_url or tweet_url
-        if link in seen_links:
+        if link in x_seen_links:
             continue
-        seen_links.add(link)
+        x_seen_links.add(link)
 
         prefix     = "📰" if article_url else "🐦"
         title_text = (text[:110] + "...") if len(text) > 110 else text
@@ -459,9 +466,10 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         "join my group", "join our tg", "join our telegram", "join our discord",
         "join our channel", "join our group", "join the group", "join the channel",
         "link in bio", "check my bio", "link in my bio",
-        # Suspicious phrases
+        # Suspicious earnings / money scripts
         "turned $", "turned my $", "i turned", "flipped my",
         "made $", "made me $", "made him $", "made her $",
+        "bring me $", "money print", "print script", "money script",
         "passive income", "financial freedom", "quit your job",
         "early access", "exclusive access", "alpha call",
     ]
@@ -516,9 +524,9 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
                 break
 
         link = article_url or tweet_url
-        if link in seen_links:
+        if link in x_seen_links:
             continue
-        seen_links.add(link)
+        x_seen_links.add(link)
 
         prefix     = "📰" if article_url else "🐦"
         title_text = (text[:110] + "...") if len(text) > 110 else text
@@ -559,7 +567,8 @@ async def build_telugu_section(key: str, articles: list) -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_digest(app: Application, chat_id: int):
-    global todays_digest
+    global todays_digest, x_seen_links
+    x_seen_links = set()   # reset cross-section dedup for each digest run
     date_str = datetime.utcnow().strftime("%A, %d %B %Y")
     await app.bot.send_message(chat_id=chat_id, parse_mode="HTML", text=(
         f"🌅 <b>శుభోదయం!</b>\n📅 {h(date_str)}\n\n"
@@ -800,8 +809,9 @@ def reschedule_jobs(app: Application):
 
 
 async def scheduled_digest(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("📰 Sending scheduled digest...")
-    await send_digest(context.application, TELEGRAM_CHAT_ID)
+    logger.info(f"📰 Sending scheduled digest to {len(CHAT_IDS)} recipient(s)...")
+    for chat_id in CHAT_IDS:
+        await send_digest(context.application, chat_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1002,7 +1012,8 @@ async def post_init(app: Application):
     reschedule_jobs(app)
     # Send digest immediately on startup (GitHub Action triggers at 7 AM IST)
     logger.info("📰 Sending startup digest...")
-    await send_digest(app, TELEGRAM_CHAT_ID)
+    for chat_id in CHAT_IDS:
+        await send_digest(app, chat_id)
 
 
 def main():
