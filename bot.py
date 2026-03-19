@@ -337,9 +337,17 @@ async def fetch_x_ai_tweets(count: int = 5) -> list:
             "passive income", "financial freedom", "quit your job",
             "early access", "alpha call", "follow me", "dm me", "dm for",
             "bring me $", "money print", "print script", "money script",
+            # Referral / trading bot scams
+            "copytrade", "copy trade", "?start=ref_", "t.me/", "100% win rate",
+            "win rate", "turned $1", "into $1", "trade bot", "trading bot",
+            "sniper bot", "wallets/0x", "account:", "results:", "largest win:",
         ]
         if any(s in text.lower() for s in scam_kw):
             logger.info(f"Skipping scam AI tweet: {text[:60]}")
+            continue
+        # Catch "turn(ed) $<number> into" money-flip pattern
+        if re.search(r"turn\w*\s+\$[\d,\.k]+\s+into", text.lower()):
+            logger.info(f"Skipping money-flip AI tweet: {text[:60]}")
             continue
 
         # Must mention AI topic
@@ -472,6 +480,10 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         "bring me $", "money print", "print script", "money script",
         "passive income", "financial freedom", "quit your job",
         "early access", "exclusive access", "alpha call",
+        # Referral / trading bot scams
+        "copytrade", "copy trade", "?start=ref_", "t.me/", "100% win rate",
+        "win rate", "turned $1", "into $1", "trade bot", "trading bot",
+        "sniper bot", "wallets/0x", "account:", "results:", "largest win:",
     ]
 
     for item in raw_tweets:
@@ -493,6 +505,10 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         if any(s in text_lower for s in scam_kw):
             logger.info(f"Skipping scam crypto tweet: {text[:60]}")
             continue
+        # Catch "turn(ed) $<number> into" money-flip pattern
+        if re.search(r"turn\w*\s+\$[\d,\.k]+\s+into", text.lower()):
+            logger.info(f"Skipping money-flip crypto tweet: {text[:60]}")
+            continue
 
         # Must mention legitimate crypto keyword
         if not any(k in text_lower for k in crypto_kw):
@@ -500,7 +516,7 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
 
         # Require minimum engagement — filters out bot/spam accounts
         likes = item.get("likeCount") or 0
-        if int(likes) < 5:
+        if int(likes) < 50:
             continue
 
         likes  = item.get("likeCount")   or 0
