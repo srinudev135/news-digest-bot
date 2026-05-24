@@ -204,7 +204,7 @@ Return a JSON object with ONLY these keys:
 Reply with ONLY raw JSON, no markdown fences."""
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=400,
+            model="claude-sonnet-4-6", max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = re.sub(r"^```[a-z]*\n?|\n?```$", "", resp.content[0].text.strip())
@@ -451,8 +451,7 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
     if not raw_tweets:
         return []
 
-    results    = []
-    seen_links = set()
+    results = []
 
     # Legitimate crypto keywords
     crypto_kw = ["bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain",
@@ -519,7 +518,6 @@ async def fetch_x_crypto_tweets(count: int = 5) -> list:
         if int(likes) < 50:
             continue
 
-        likes  = item.get("likeCount")   or 0
         rts    = item.get("retweetCount") or 0
         views  = item.get("viewCount")    or 0
         stats  = f"❤️ {int(likes):,}  🔁 {int(rts):,}  👁 {int(views):,}"
@@ -854,7 +852,7 @@ async def ask_claude(chat_id: int, message: str) -> str:
     conversation_history[chat_id].append({"role": "user", "content": message})
     try:
         resp = claude.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=400,
+            model="claude-sonnet-4-6", max_tokens=400,
             system=build_system_prompt(),
             messages=conversation_history[chat_id][-20:],
         )
